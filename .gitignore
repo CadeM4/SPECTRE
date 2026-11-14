@@ -1,0 +1,10 @@
+/target
+/.DS_Store
+/*.jsonl
+/*.pcap
+/*.pcapng
+/.spectre
+/Spectre Initial Prompt.txt
+/Spectre Additional Things.txt
+__pycache__/
+*.pyc

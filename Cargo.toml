@@ -1,0 +1,28 @@
+[package]
+name = "spectre"
+version = "0.1.0"
+edition = "2024"
+authors = ["Cade Masterson"]
+description = "Terminal intelligence and security research environment"
+repository = "https://github.com/CadeM4/SPECTRE"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.6", features = ["derive"] }
+crossterm = "0.29"
+dirs = "6"
+object = { version = "0.40", features = ["read"] }
+ratatui = "0.30.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sysinfo = "0.40.3"
+tokio = { version = "1", features = ["full"] }
+toml = "0.9"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
