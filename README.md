@@ -17,7 +17,7 @@ SPECTRE brings local observations, offline artifact analysis, and explicitly sco
 | HTTP assessment | One scoped HTTP(S) response, including headers, cookie attributes, and HSTS observations. Redirects are not followed. |
 | Indicator matching | User-configured SHA-256, domain, and IP values matched against supported observation fields, with source event references. |
 | Investigation | A bounded event history, evidence inspection, subject links across modules, profile presets, and JSON Lines export. |
-| Terminal workspace | Responsive overview, timeline, and evidence views; four themes; autonomous, interactive, and assisted input modes. |
+| Terminal workspace | Responsive overview, timeline, and evidence views; four themes; autonomous and interactive modes, plus built-in assisted scenarios. |
 
 SPECTRE does not yet include live packet capture, disassembly, runtime instrumentation, external threat intelligence, a plugin API, or binary releases. The [roadmap](docs/ROADMAP.md) tracks those directions separately from implemented behavior.
 
@@ -31,6 +31,8 @@ spectre doctor
 spectre profiles
 spectre
 ```
+
+On macOS or Linux, if the shell reports `spectre: command not found` after installation, run `~/.cargo/bin/spectre` or add `~/.cargo/bin` to your `PATH`.
 
 `spectre` opens the terminal workspace when standard input and output are attached to a terminal. On first launch it chooses a local profile from detected memory, then writes the configuration. Systems with at least 8 GiB of RAM start with `binary-monitor`; other systems use `local-research`. Both profiles inspect real executables from the local process baseline, including SPECTRE itself when available. `local-research` uses a smaller queue and one analysis slot; `binary-monitor` covers more paths with two slots. Each profile then watches its bounded set of executable paths for metadata changes. Local observation starts automatically. It does not scan external targets in the background.
 
@@ -69,7 +71,9 @@ spectre http http://192.0.2.10/
 
 The addresses above are documentation examples. `scope add` records the target in the local configuration; it does not probe it. A scan uses only the ports supplied or the documented default set. `investigate` checks its selected ports and, when conventional web ports are open, makes bounded HTTP follow-ups pinned to the observed addresses. HTTP inspection makes one GET request and does not follow redirects.
 
-Inside the workspace, press `/` for interactive command input and `F1` for the keyboard reference. `F2` cycles input modes while local collection continues. Assisted input reveals prepared text one character per ordinary typing key. A completed step is recorded with `prepared` provenance and is never executed. See [usage](docs/USAGE.md) for commands, configuration, provenance, and limits.
+Inside the workspace, press `/` for interactive command input and `F1` for the keyboard reference. `F2` cycles input modes while local collection continues. Assisted mode includes a six-stage local investigation without requiring a user-authored plan. Press `F6` in assisted mode to run the entire local session with one key, or reveal each prepared command by typing and run it with Enter. The stages are Environment, Collection, Initial triage, Binary inspection, Indicators, and Final review. The `triage` command summarizes retained observation counts, recent subjects, indicator matches, correlation links, and latest observation IDs.
+
+Each configured exact target has a selectable scoped network scenario. `Tab` and `Shift+Tab` switch scenarios. Passive local review steps run on Enter after a full reveal; active network steps require an explicit `Ctrl+R` and still obey scope limits. Custom prepared text can also be added, but it is only recorded, never executed. Assisted mode is a deterministic presentation workflow, not an AI assistant. See [usage](docs/USAGE.md) for controls and scope.
 
 ### Offline binary analysis session
 
