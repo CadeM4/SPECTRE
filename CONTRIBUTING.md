@@ -1,6 +1,6 @@
 # Contributing
 
-SPECTRE is created and led by Cade Masterson. The codebase is in active development and a project license has not yet been selected. Discuss substantial external contributions with the project lead before submitting them. Existing third-party licenses and accurate contributor credit must be preserved.
+SPECTRE is created and led by Cade Masterson. The codebase is in active development and is licensed under MIT OR Apache-2.0. Discuss substantial external contributions with the project lead before submitting them. Existing third-party licenses and accurate contributor credit must be preserved.
 
 ## Development checks
 

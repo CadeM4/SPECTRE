@@ -85,4 +85,4 @@ Analyzers return structured events. An event has a timestamp, module, subject, s
 
 ## Project status and licensing
 
-SPECTRE is being developed for public release under Cade Masterson's project leadership. A project license has not yet been selected or granted. The [roadmap](docs/ROADMAP.md#licensing-and-release) records a recommended dual-license option and the steps required before distribution. Third-party dependencies retain their own license terms.
+SPECTRE is an early working foundation created and led by Cade Masterson. It is available under your choice of the [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) license. Third-party dependencies retain their own license terms. The [roadmap](docs/ROADMAP.md#licensing-and-release) tracks the work remaining before a tagged release and packaged binaries.

@@ -23,6 +23,6 @@ Each addition should preserve bounded resource use and distinguish observations 
 
 ## Licensing and release
 
-No project license has been granted yet. For the intended open-source Rust distribution, the recommended option is **MIT OR Apache-2.0**, which lets recipients choose either permissive license. Apache-2.0 includes an express patent grant; the dual-license form is documented by [Cargo](https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields) and is common in the Rust ecosystem. The [OSI Apache-2.0 text](https://opensource.org/license/apache-2.0) sets out its terms. This is a recommendation for Cade Masterson to decide before public release, not an effective license statement.
+SPECTRE is licensed under **MIT OR Apache-2.0**. Recipients may choose either [MIT](../LICENSE-MIT) or [Apache-2.0](../LICENSE-APACHE), and Cargo declares the same expression. The project attribution belongs to Cade Masterson; dependency licenses and contributor credit remain intact.
 
-Before publication, select the license, add its full text and a matching Cargo manifest field, review dependency notices, verify builds on macOS/Linux/Windows, capture accurate interface screenshots, and publish a tagged release with checksums. Binary releases and package manager entries should follow verified platform builds.
+Before the first tagged release, review dependency notices, verify source installs on macOS/Linux/Windows, prepare release notes, and publish platform artifacts with checksums. Binary releases and package manager entries should follow verified platform builds.
