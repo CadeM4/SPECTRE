@@ -139,6 +139,23 @@ pub(crate) fn referenced_source_ids(event: &Event) -> Vec<String> {
             .filter(|evidence| evidence.label == "source_event_id")
             .map(|evidence| evidence.value.clone())
             .collect(),
+        (
+            "presentation",
+            "assisted.action" | "assisted.run.complete" | "assisted.session.stage",
+        ) => event
+            .evidence
+            .iter()
+            .flat_map(|evidence| match evidence.label.as_str() {
+                "prepared_event_id" => vec![evidence.value.clone()],
+                "result_event_ids" => evidence
+                    .value
+                    .split(',')
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect(),
         _ => Vec::new(),
     }
 }

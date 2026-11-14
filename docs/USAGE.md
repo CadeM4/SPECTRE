@@ -9,6 +9,7 @@ Run `spectre --help` for the current top-level syntax. The same analysis operati
 | `spectre` or `spectre launch` |  | Open the terminal workspace. |
 | `spectre doctor` | `doctor` | Report OS, architecture, terminal availability, built-in modules, and optional tools found on `PATH`. |
 | `spectre doctor --json` |  | Print the capability report as JSON. |
+|  | `triage` | Summarize retained observation counts by module and severity, recent subjects, indicator match and correlation link counts, and latest observation IDs. |
 | `spectre version` or `spectre --version` |  | Show the installed version; `spectre version` also prints creator attribution. |
 | `spectre analyze binary PATH` | `binary PATH` | Inspect a local executable or object file. |
 | `spectre analyze pcap PATH` | `pcap PATH` | Inspect a classic PCAP file. |
@@ -22,7 +23,7 @@ Run `spectre --help` for the current top-level syntax. The same analysis operati
 | `spectre themes` or `spectre themes NAME` | `theme list` or `theme NAME` | List or select a terminal theme. |
 | `spectre modules` or `spectre modules enable|disable NAME` | `module list` or `module enable|disable NAME` | Inspect or change autonomous modules. |
 |  | `autonomous on|off` | Change local collection at runtime and save the setting. |
-|  | `workflow list`, `workflow add TEXT`, `workflow remove INDEX`, `workflow clear` | Manage the ordered assisted input sequence. Indices start at 1. |
+|  | `workflow list`, `workflow add TEXT`, `workflow remove INDEX`, `workflow clear` | Manage optional custom assisted presentation steps. Indices start at 1. |
 |  | `retention`, `retention set COUNT` | Show or save the event history limit. The hub uses the new limit on the next launch. |
 | `spectre scan HOST --ports 22,80,443` | `scan HOST 22,80,443` | Run bounded TCP connect checks. |
 | `spectre investigate HOST --ports 22,80,443` | `investigate HOST 22,80,443` | Scan selected ports and inspect HTTP on observed open web ports. |
@@ -59,6 +60,11 @@ Scope matching uses a single normalized hostname or IP address. Hostnames are ca
 | `F3` | Cycle overview, timeline, and evidence views. |
 | `F4` | Cycle the four themes. |
 | `F5` | Open workspace settings. |
+| `F6` in assisted mode | Run the complete six-stage local research session with one key. |
+| `Tab` / `Shift+Tab` in assisted mode | Select the next or previous built-in or custom scenario. |
+| `Left` in assisted mode | Return to the previous stage and reset its prepared input. |
+| `Enter` in assisted mode | After a full reveal, run a local built-in step; record and advance an active network or custom step without running it. |
+| `Ctrl+R` in assisted mode | Explicitly run a fully revealed active step in the scoped network scenario. |
 | `Ctrl+J` / `Ctrl+K` | Select newer or older observation. |
 | `PageDown` / `PageUp` | Move selection by ten observations. |
 | `/` in autonomous mode | Open interactive command input. |
@@ -69,9 +75,15 @@ Scope matching uses a single normalized hostname or IP address. Hostnames are ca
 
 The settings panel currently changes profile (`p`), theme (`t`), view arrangement (`l`), refresh interval (`r`), and local autonomous collection (`a`). Profile, theme, refresh, and autonomous settings are saved. The arrangement applies to the current workspace session. The terminal must be at least 48 columns by 10 rows; the layout becomes denser as width increases.
 
-### Assisted input
+### Assisted scenarios
 
-At the workspace prompt, add steps and inspect the sequence, then press `F2` until the assisted mode is selected:
+No user-authored plan is needed. Press `F2` until **ASSISTED** appears. The default local scenario has six stages: Environment, Collection, Initial triage, Binary inspection, Indicators, and Final review. It checks the platform, enabled modules, and configured indicators; inspects SPECTRE's executable if it fits the 64 MiB analyzer limit, otherwise a small real platform executable; and summarizes retained observations before and after that analysis with `triage`. Press `F6` to run all six local read-only steps in order with one key. Background local collection continues throughout. The scenario uses the same local commands and evidence as interactive mode.
+
+Each ordinary character key reveals the next character of the prepared input, regardless of the key pressed. Backspace retracts one character; Escape resets the current step; Left revisits the previous stage. After a local built-in command is fully revealed, Enter runs it and advances when the result arrives. If the step fails, it stays in place and Enter retries it. The resulting observations appear in the normal event stream. Enter does nothing until the current input is fully revealed.
+
+Use `Tab` and `Shift+Tab` to switch scenarios. A separate network scenario appears for each exact target added to `allowed_targets`, for example with `scope add 127.0.0.1` in interactive mode. Adding a target changes configuration but sends no network traffic. In a network scenario, local review steps such as scope and evidence summaries run on Enter after a full reveal. Active scan, investigation, and HTTP steps must be fully revealed and then run with `Ctrl+R`. Enter alone records and advances an active step without making the request. Normal target-scope and execution limits still apply. `F6` runs only the local research session; it does not start network work. No external target is scanned automatically.
+
+Custom sequences remain available. In interactive mode, enter the following, then return to assisted mode and select the custom scenario with `Tab`:
 
 ```text
 workflow add "binary /path/to/program"
@@ -79,11 +91,9 @@ workflow add "pcap /path/to/capture.pcap"
 workflow list
 ```
 
-Use `workflow remove 2` to remove one step or `workflow clear` to empty the sequence. The entries are saved in `prepared_workflow` in the configuration, with at most 256 steps and 4,096 bytes per step. These commands do not execute the prepared text. To change the event limit from the prompt, use `retention set 5000`; the workspace display adopts it immediately, and the event hub adopts it on the next launch.
+For a custom step, Enter after the full reveal records a `prepared.input` event with `prepared` provenance and advances. Custom text is **never executed**. Use `workflow remove 2` or `workflow clear` to edit the sequence. Entries are saved in `prepared_workflow` in the configuration, with at most 256 steps and 4,096 bytes per step. Recorded prepared input is included in a JSON Lines export if it remains in memory. To run a custom command, switch to interactive mode and enter it there.
 
-Each ordinary character key reveals the next character of the current entry, regardless of the key's character. Backspace retracts one revealed character. Enter advances only after the entry is complete. Escape resets the current entry. Control keys do not advance it. When Enter completes a fully revealed step, the workspace records a `prepared.input` event with `prepared` provenance and the configured text. Typing `present` at the interactive prompt cannot create that event. Prepared text is never executed. The event is included in a JSON Lines export if it remains in memory. To run an operation, switch to interactive mode and enter a real command. Local background collection can continue while assisted input is shown.
-
-This is a minimal prepared sequence implementation. Multi-field scenario editing, recorded playback, command-aware fields, and controlled execution transitions remain planned work.
+Assisted mode is a deterministic prepared presentation, not an AI assistant or a shell. To change the event limit from the interactive prompt, use `retention set 5000`; the workspace display adopts it immediately, and the event hub adopts it on the next launch.
 
 ## Configuration
 
@@ -98,7 +108,7 @@ Run `spectre configure` to locate the platform-specific configuration file. The 
 | `autonomous` | `true` | Start local collection when launching the workspace. |
 | `allowed_targets` | `[]` | Exact-match hosts or IP strings for active commands. |
 | `enabled_modules` | Selected by first-run profile | Local modules to run. `binary` enables bounded baseline and follow-up inspection of observed process executables and requires `process`; `correlation` enables subject links. |
-| `prepared_workflow` | `[]` | Assisted input entries. |
+| `prepared_workflow` | `[]` | Optional custom assisted presentation entries. Built-in scenarios are available when this is empty. |
 | `indicators` | `[]` | Exact SHA-256, domain, and IP values evaluated against supported observations. |
 
 `doctor` lists optional tools such as TShark, nmap, and Ghidra when they are on `PATH`. These are discovery results, not active integrations. An unavailable optional tool does not prevent the built-in analyzers from running.

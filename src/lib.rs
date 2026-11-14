@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod assisted;
 pub mod capability;
 pub mod command;
 pub mod config;

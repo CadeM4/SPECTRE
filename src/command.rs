@@ -1,5 +1,7 @@
 use crate::{
-    analysis, capability,
+    analysis,
+    assisted::{self, Execution},
+    capability,
     config::{Config, normalize_target},
     detection::Indicator,
     engine::EventHub,
@@ -8,6 +10,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use std::{
+    collections::{BTreeMap, HashSet},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     time::Duration,
@@ -16,7 +19,23 @@ use std::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkspaceRequest {
     Command(String),
-    AssistedCompletion { index: usize, text: String },
+    AssistedCompletion {
+        index: usize,
+        text: String,
+    },
+    AssistedStep {
+        scenario_id: String,
+        index: usize,
+        text: String,
+    },
+    AssistedRun {
+        scenario_id: String,
+        index: usize,
+        text: String,
+    },
+    AssistedRunLocalSession {
+        scenario_id: String,
+    },
 }
 
 pub async fn execute_workspace_request(
@@ -44,7 +63,300 @@ pub async fn execute_workspace_request(
             hub.publish(event.clone());
             Ok(vec![event])
         }
+        WorkspaceRequest::AssistedStep {
+            scenario_id,
+            index,
+            text,
+        } => match complete_assisted_step(&scenario_id, index, &text, hub, config_path).await {
+            Ok(mut output) => {
+                let acknowledgement = assisted_ack(
+                    "assisted.step.complete",
+                    "Assisted stage completed",
+                    &scenario_id,
+                    index,
+                    Severity::Info,
+                );
+                hub.publish(acknowledgement.clone());
+                output.push(acknowledgement);
+                Ok(output)
+            }
+            Err(error) => {
+                let acknowledgement = assisted_ack(
+                    "assisted.step.error",
+                    format!("Assisted stage failed: {error}"),
+                    &scenario_id,
+                    index,
+                    Severity::Low,
+                )
+                .with_evidence("error", error.to_string(), "execution");
+                hub.publish(acknowledgement.clone());
+                Ok(vec![acknowledgement])
+            }
+        },
+        WorkspaceRequest::AssistedRun {
+            scenario_id,
+            index,
+            text,
+        } => match run_scoped_assisted_step(&scenario_id, index, &text, hub, config_path).await {
+            Ok(mut output) => {
+                let result_ids = output
+                    .iter()
+                    .map(|event| event.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let acknowledgement = assisted_ack(
+                    "assisted.run.complete",
+                    "Scoped assisted action completed",
+                    &scenario_id,
+                    index,
+                    Severity::Info,
+                )
+                .with_evidence("command", &text, "assisted_scenario")
+                .with_evidence("result_event_ids", result_ids, "observed_results");
+                hub.publish(acknowledgement.clone());
+                output.push(acknowledgement);
+                Ok(output)
+            }
+            Err(error) => {
+                let acknowledgement = assisted_ack(
+                    "assisted.run.error",
+                    format!("Scoped assisted action failed: {error}"),
+                    &scenario_id,
+                    index,
+                    Severity::Low,
+                )
+                .with_evidence("command", &text, "assisted_scenario")
+                .with_evidence("error", error.to_string(), "execution");
+                hub.publish(acknowledgement.clone());
+                Ok(vec![acknowledgement])
+            }
+        },
+        WorkspaceRequest::AssistedRunLocalSession { scenario_id } => {
+            match run_full_local_assisted_session(&scenario_id, hub, config_path).await {
+                Ok(output) => Ok(output),
+                Err(error) => {
+                    let acknowledgement = Event::new(
+                        "presentation",
+                        "assisted.session.error",
+                        format!("Local assisted session failed: {error}"),
+                        None,
+                        Severity::Low,
+                        SourceKind::Derived,
+                    )
+                    .with_evidence("scenario", &scenario_id, "assisted_scenario")
+                    .with_evidence("error", error.to_string(), "execution");
+                    hub.publish(acknowledgement.clone());
+                    Ok(vec![acknowledgement])
+                }
+            }
+        }
     }
+}
+
+fn assisted_ack(
+    kind: &str,
+    summary: impl Into<String>,
+    scenario_id: &str,
+    index: usize,
+    severity: Severity,
+) -> Event {
+    Event::new(
+        "presentation",
+        kind,
+        summary,
+        None,
+        severity,
+        SourceKind::Derived,
+    )
+    .with_evidence("scenario", scenario_id, "assisted_scenario")
+    .with_evidence("step_index", index.to_string(), "assisted_scenario")
+}
+
+fn assisted_scenario(scenario_id: &str, config_path: &Path) -> Result<assisted::Scenario> {
+    let config = Config::load_or_default(config_path)?;
+    assisted::scenarios(&config)
+        .into_iter()
+        .find(|scenario| scenario.id == scenario_id)
+        .context("assisted scenario is no longer available")
+}
+
+async fn complete_assisted_step(
+    scenario_id: &str,
+    index: usize,
+    text: &str,
+    hub: &EventHub,
+    config_path: &Path,
+) -> Result<Vec<Event>> {
+    let scenario = assisted_scenario(scenario_id, config_path)?;
+    let step = scenario
+        .steps
+        .get(index.saturating_sub(1))
+        .filter(|_| index > 0)
+        .context("assisted step is outside the selected scenario")?;
+    if step.input != text {
+        bail!("completed assisted step does not match the selected scenario");
+    }
+    if step.execution == Execution::Local && !is_safe_local_assisted_command(text)? {
+        bail!("assisted local step is not an approved read-only command");
+    }
+    let prepared = Event::new(
+        "presentation",
+        "prepared.input",
+        format!("{} · {} revealed", scenario.title, step.phase),
+        None,
+        Severity::Info,
+        SourceKind::Prepared,
+    )
+    .with_evidence("scenario", &scenario.id, "assisted_scenario")
+    .with_evidence("step_index", index.to_string(), "assisted_scenario")
+    .with_evidence("phase", &step.phase, "assisted_scenario")
+    .with_evidence("input", text, "assisted_scenario");
+    hub.publish(prepared.clone());
+    let prepared_id = prepared.id.clone();
+    let mut output = vec![prepared];
+    if step.execution == Execution::Local {
+        let results = execute_line(text, hub, config_path).await?;
+        let event_ids = results
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let completion = assisted_ack(
+            "assisted.action",
+            format!("{} · {} completed", scenario.title, step.phase),
+            &scenario.id,
+            index,
+            Severity::Info,
+        )
+        .with_evidence("command", text, "assisted_scenario")
+        .with_evidence("prepared_event_id", prepared_id, "event id")
+        .with_evidence("result_event_ids", event_ids, "observed_results");
+        hub.publish(completion.clone());
+        output.extend(results);
+        output.push(completion);
+    }
+    Ok(output)
+}
+
+async fn run_scoped_assisted_step(
+    scenario_id: &str,
+    index: usize,
+    text: &str,
+    hub: &EventHub,
+    config_path: &Path,
+) -> Result<Vec<Event>> {
+    let scenario = assisted_scenario(scenario_id, config_path)?;
+    let step = scenario
+        .steps
+        .get(index.saturating_sub(1))
+        .filter(|_| index > 0)
+        .context("assisted step is outside the selected scenario")?;
+    if step.input != text {
+        bail!("scoped assisted action changed; reveal the stage again");
+    }
+    if step.execution != Execution::Explicit || !is_scoped_assisted_command(text)? {
+        bail!("this assisted step has no explicit network action");
+    }
+    execute_line(text, hub, config_path).await
+}
+
+async fn run_full_local_assisted_session(
+    scenario_id: &str,
+    hub: &EventHub,
+    config_path: &Path,
+) -> Result<Vec<Event>> {
+    let scenario = assisted_scenario(scenario_id, config_path)?;
+    if scenario.id != "local-research"
+        || scenario.steps.is_empty()
+        || scenario
+            .steps
+            .iter()
+            .any(|step| step.execution != Execution::Local)
+    {
+        bail!("only the bundled local research scenario supports a full run");
+    }
+    let started = Event::new(
+        "presentation",
+        "assisted.session.start",
+        format!("{} session started", scenario.title),
+        None,
+        Severity::Info,
+        SourceKind::Derived,
+    )
+    .with_evidence("scenario", &scenario.id, "assisted_scenario")
+    .with_evidence(
+        "stages",
+        scenario.steps.len().to_string(),
+        "assisted_scenario",
+    );
+    hub.publish(started.clone());
+    let mut output = vec![started];
+    let mut succeeded = 0usize;
+    for (position, step) in scenario.steps.iter().enumerate() {
+        let index = position + 1;
+        let result = if is_safe_local_assisted_command(&step.input)? {
+            execute_line(&step.input, hub, config_path).await
+        } else {
+            anyhow::bail!("bundled local stage is not an approved read-only command")
+        };
+        let mut stage = assisted_ack(
+            "assisted.session.stage",
+            format!("{} · {}", scenario.title, step.phase),
+            &scenario.id,
+            index,
+            Severity::Info,
+        )
+        .with_evidence("phase", &step.phase, "assisted_scenario")
+        .with_evidence("command", &step.input, "assisted_scenario");
+        match result {
+            Ok(events) => {
+                succeeded += 1;
+                let event_ids = events
+                    .iter()
+                    .map(|event| event.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                stage = stage
+                    .with_evidence("status", "complete", "execution")
+                    .with_evidence("result_event_ids", event_ids, "observed_results");
+                output.extend(events);
+            }
+            Err(error) => {
+                stage.severity = Severity::Low;
+                stage = stage
+                    .with_evidence("status", "error", "execution")
+                    .with_evidence("error", error.to_string(), "execution");
+            }
+        }
+        hub.publish(stage.clone());
+        output.push(stage);
+    }
+    let completed = Event::new(
+        "presentation",
+        "assisted.session.complete",
+        format!(
+            "{} session complete: {succeeded}/{} stages succeeded",
+            scenario.title,
+            scenario.steps.len()
+        ),
+        None,
+        if succeeded == scenario.steps.len() {
+            Severity::Info
+        } else {
+            Severity::Low
+        },
+        SourceKind::Derived,
+    )
+    .with_evidence("scenario", &scenario.id, "assisted_scenario")
+    .with_evidence("succeeded", succeeded.to_string(), "execution")
+    .with_evidence(
+        "failed",
+        (scenario.steps.len() - succeeded).to_string(),
+        "execution",
+    );
+    hub.publish(completed.clone());
+    output.push(completed);
+    Ok(output)
 }
 
 pub async fn execute_line(line: &str, hub: &EventHub, config_path: &Path) -> Result<Vec<Event>> {
@@ -57,7 +369,7 @@ pub async fn execute_line(line: &str, hub: &EventHub, config_path: &Path) -> Res
     hub.set_indicators(canonical_indicators.clone());
     let output = match words[0].as_str() {
         "help" => vec![Event::new("command", "command.help", "Command reference (F1 for keyboard controls)", None, Severity::Info, SourceKind::Live)
-            .with_evidence("commands", "binary <file>\npcap <file>\nscan <target> [ports]\ninvestigate <target> [ports]\nhttp <url>\nscope add|remove|list\nindicator add|remove|list\nprofile <name>|list\ntheme <name>|list\nmodule enable|disable|list\nautonomous on|off\nworkflow list|add|remove|clear\nretention [set COUNT]\nexport <file>\ndoctor", "built_in")],
+            .with_evidence("commands", "binary <file>\npcap <file>\nscan <target> [ports]\ninvestigate <target> [ports]\nhttp <url>\nscope add|remove|list\nindicator add|remove|list\nprofile <name>|list\ntheme <name>|list\nmodule enable|disable|list\nautonomous on|off\nworkflow list|add|remove|clear\nretention [set COUNT]\ntriage\nexport <file>\ndoctor", "built_in")],
         "doctor" => {
             let report = capability::inspect();
             let found = report.tools.iter().filter(|tool| tool.path.is_some()).count();
@@ -68,6 +380,7 @@ pub async fn execute_line(line: &str, hub: &EventHub, config_path: &Path) -> Res
             let path = PathBuf::from(&words[1]);
             tokio::task::spawn_blocking(move || analysis::analyze_binary(&path)).await??
         }
+        "triage" if words.len() == 1 => vec![triage_snapshot(&hub.snapshot())],
         "pcap" if words.len() == 2 => {
             let path = PathBuf::from(&words[1]);
             tokio::task::spawn_blocking(move || analysis::analyze_pcap(&path)).await??
@@ -358,6 +671,100 @@ pub async fn execute_line(line: &str, hub: &EventHub, config_path: &Path) -> Res
         hub.publish(event.clone());
     }
     Ok(output)
+}
+
+fn is_safe_local_assisted_command(line: &str) -> Result<bool> {
+    let words = tokenize(line)?;
+    Ok(match words.as_slice() {
+        [command] => matches!(command.as_str(), "doctor" | "triage"),
+        [command, action] => {
+            matches!(
+                (command.as_str(), action.as_str()),
+                ("module", "list") | ("indicator", "list") | ("scope", "list")
+            ) || command == "binary"
+        }
+        _ => false,
+    })
+}
+
+fn is_scoped_assisted_command(line: &str) -> Result<bool> {
+    let words = tokenize(line)?;
+    Ok(match words.as_slice() {
+        [command, _target] => matches!(command.as_str(), "scan" | "investigate" | "http"),
+        [command, _target, _ports] => matches!(command.as_str(), "scan" | "investigate"),
+        _ => false,
+    })
+}
+
+fn triage_snapshot(events: &[Event]) -> Event {
+    let observations = events
+        .iter()
+        .filter(|event| matches!(event.source, SourceKind::Live | SourceKind::File))
+        .filter(|event| {
+            matches!(
+                event.module.as_str(),
+                "host" | "process" | "binary" | "pcap" | "tcp" | "http" | "investigation"
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut by_module = BTreeMap::<&str, usize>::new();
+    let mut by_severity = BTreeMap::<Severity, usize>::new();
+    for event in &observations {
+        *by_module.entry(&event.module).or_default() += 1;
+        *by_severity.entry(event.severity).or_default() += 1;
+    }
+    let mut seen = HashSet::new();
+    let recent_subjects = observations
+        .iter()
+        .rev()
+        .filter_map(|event| event.subject.as_deref())
+        .filter(|subject| seen.insert(*subject))
+        .take(5)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let recent_ids = observations
+        .iter()
+        .rev()
+        .take(5)
+        .map(|event| event.id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let indicator_matches = events
+        .iter()
+        .filter(|event| event.module == "detection" && event.kind == "indicator.match")
+        .count();
+    let subject_links = events
+        .iter()
+        .filter(|event| event.module == "correlation" && event.kind == "subject.link")
+        .count();
+    let modules = by_module
+        .iter()
+        .map(|(module, count)| format!("{module}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let severities = by_severity
+        .iter()
+        .map(|(severity, count)| format!("{severity:?}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Event::new(
+        "investigation",
+        "investigation.triage",
+        format!(
+            "Retained snapshot: {} observations across {} modules; {indicator_matches} indicator matches",
+            observations.len(),
+            by_module.len()
+        ),
+        None,
+        Severity::Info,
+        SourceKind::Derived,
+    )
+    .with_evidence("modules", modules, "retained_observations")
+    .with_evidence("severity_counts", severities, "retained_observations")
+    .with_evidence("indicator_matches", indicator_matches.to_string(), "retained_events")
+    .with_evidence("subject_links", subject_links.to_string(), "retained_events")
+    .with_evidence("recent_subjects", recent_subjects, "retained_observations")
+    .with_evidence("recent_observation_ids", recent_ids, "retained_observations")
 }
 
 pub fn status(summary: impl Into<String>) -> Event {
@@ -675,6 +1082,247 @@ mod tests {
             .is_err()
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn built_in_assisted_step_runs_local_work_with_separate_provenance() {
+        let path = std::env::temp_dir().join(format!(
+            "spectre-assisted-command-test-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        Config::default().save(&path).unwrap();
+        let hub = EventHub::new(100);
+        let output = execute_workspace_request(
+            WorkspaceRequest::AssistedStep {
+                scenario_id: "local-research".into(),
+                index: 1,
+                text: "doctor".into(),
+            },
+            &hub,
+            &path,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output[0].kind, "prepared.input");
+        assert_eq!(output[0].source, SourceKind::Prepared);
+        assert!(output.iter().any(|event| event.kind == "command.doctor"));
+        let action = output
+            .iter()
+            .find(|event| event.kind == "assisted.action")
+            .unwrap();
+        let referenced = crate::engine::referenced_source_ids(action);
+        assert_eq!(referenced.len(), 2);
+        assert!(referenced.iter().all(|id| {
+            output
+                .iter()
+                .any(|event| &event.id == id && event.kind != "assisted.action")
+        }));
+        assert_eq!(output.last().unwrap().kind, "assisted.step.complete");
+        let rejected = execute_workspace_request(
+            WorkspaceRequest::AssistedStep {
+                scenario_id: "local-research".into(),
+                index: 1,
+                text: "scan 127.0.0.1 22".into(),
+            },
+            &hub,
+            &path,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rejected[0].kind, "assisted.step.error");
+        let rejected = execute_workspace_request(
+            WorkspaceRequest::AssistedRun {
+                scenario_id: "local-research".into(),
+                index: 1,
+                text: "doctor".into(),
+            },
+            &hub,
+            &path,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rejected[0].kind, "assisted.run.error");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn network_assisted_reveal_does_not_start_a_scan() {
+        let path = std::env::temp_dir().join(format!(
+            "spectre-assisted-network-test-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut config = Config {
+            allowed_targets: vec!["127.0.0.1".into()],
+            ..Config::default()
+        };
+        config.save(&path).unwrap();
+        let hub = EventHub::new(100);
+        let scenario = assisted::scenarios(&config)[1].clone();
+        let step = scenario.steps[1].input.clone();
+        let output = execute_workspace_request(
+            WorkspaceRequest::AssistedStep {
+                scenario_id: scenario.id.clone(),
+                index: 2,
+                text: step.clone(),
+            },
+            &hub,
+            &path,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0].source, SourceKind::Prepared);
+        assert_eq!(output[1].kind, "assisted.step.complete");
+        assert!(hub.snapshot().iter().all(|event| event.module != "tcp"));
+
+        let changed = execute_workspace_request(
+            WorkspaceRequest::AssistedRun {
+                scenario_id: scenario.id.clone(),
+                index: 2,
+                text: "scan 192.0.2.1 22".into(),
+            },
+            &hub,
+            &path,
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed[0].kind, "assisted.run.error");
+        assert!(hub.snapshot().iter().all(|event| event.module != "tcp"));
+
+        config.allowed_targets.clear();
+        config.save(&path).unwrap();
+        let denied = execute_workspace_request(
+            WorkspaceRequest::AssistedRun {
+                scenario_id: scenario.id,
+                index: 2,
+                text: step,
+            },
+            &hub,
+            &path,
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied[0].kind, "assisted.run.error");
+        assert!(hub.snapshot().iter().all(|event| event.module != "tcp"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_local_assisted_session_runs_all_stages_with_one_request() {
+        let path = std::env::temp_dir().join(format!(
+            "spectre-assisted-full-test-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        Config::default().save(&path).unwrap();
+        let hub = EventHub::new(2_000);
+        let output = execute_workspace_request(
+            WorkspaceRequest::AssistedRunLocalSession {
+                scenario_id: "local-research".into(),
+            },
+            &hub,
+            &path,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output[0].kind, "assisted.session.start");
+        assert_eq!(
+            output
+                .iter()
+                .filter(|event| event.kind == "assisted.session.stage")
+                .count(),
+            6
+        );
+        assert_eq!(output.last().unwrap().kind, "assisted.session.complete");
+        assert!(output.iter().any(|event| event.kind == "command.doctor"));
+        assert!(
+            output
+                .iter()
+                .any(|event| event.kind == "investigation.triage")
+        );
+        let binary_stage = output
+            .iter()
+            .find(|event| {
+                event.kind == "assisted.session.stage"
+                    && event
+                        .evidence
+                        .iter()
+                        .any(|item| item.label == "step_index" && item.value == "4")
+            })
+            .unwrap();
+        assert!(binary_stage.evidence.iter().any(|item| {
+            item.label == "status" && matches!(item.value.as_str(), "complete" | "error")
+        }));
+        let complete = output.last().unwrap();
+        let succeeded: usize = complete
+            .evidence
+            .iter()
+            .find(|item| item.label == "succeeded")
+            .unwrap()
+            .value
+            .parse()
+            .unwrap();
+        let failed: usize = complete
+            .evidence
+            .iter()
+            .find(|item| item.label == "failed")
+            .unwrap()
+            .value
+            .parse()
+            .unwrap();
+        assert_eq!(succeeded + failed, 6);
+        assert!(output.iter().all(|event| event.kind != "prepared.input"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn triage_counts_only_retained_observations() {
+        let events = vec![
+            Event::new(
+                "host",
+                "host.sample",
+                "sample",
+                None,
+                Severity::Info,
+                SourceKind::Live,
+            ),
+            Event::new(
+                "binary",
+                "binary.format",
+                "Mach-O",
+                Some("/bin/ls".into()),
+                Severity::Info,
+                SourceKind::File,
+            ),
+            Event::new(
+                "presentation",
+                "prepared.input",
+                "typed",
+                None,
+                Severity::Info,
+                SourceKind::Prepared,
+            ),
+        ];
+        let summary = triage_snapshot(&events);
+        assert_eq!(summary.source, SourceKind::Derived);
+        assert!(summary.summary.contains("2 observations across 2 modules"));
+        assert!(
+            summary
+                .evidence
+                .iter()
+                .any(|item| { item.label == "recent_subjects" && item.value == "/bin/ls" })
+        );
     }
 
     #[tokio::test]
