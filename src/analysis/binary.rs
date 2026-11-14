@@ -404,7 +404,22 @@ mod tests {
 
     #[test]
     fn inspects_real_executable_with_provenance() {
-        let path = std::env::current_exe().unwrap();
+        let current = std::env::current_exe().unwrap();
+        let path = if fs::metadata(&current).unwrap().len() <= MAX_BINARY_BYTES {
+            current
+        } else {
+            // CI test harnesses can exceed the analyzer's deliberate input limit.
+            #[cfg(windows)]
+            {
+                std::env::var_os("ComSpec")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"))
+            }
+            #[cfg(not(windows))]
+            {
+                std::path::PathBuf::from("/bin/ls")
+            }
+        };
         let expected_hash = format!("{:x}", Sha256::digest(fs::read(&path).unwrap()));
         let events = analyze_binary(&path).unwrap();
         assert!(events.iter().any(|event| event.kind == "binary.identity"));
