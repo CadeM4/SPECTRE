@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::model::{Event, Severity, SourceKind};
 
-const MAX_BINARY_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SECTIONS: usize = 128;
 const MAX_IMPORTS: usize = 256;
 const MAX_IMPORT_INSPECTION: usize = 8192;

@@ -1245,7 +1245,43 @@ mod tests {
             6
         );
         assert_eq!(output.last().unwrap().kind, "assisted.session.complete");
-        assert!(output.iter().any(|event| event.module == "binary"));
+        assert!(output.iter().any(|event| event.kind == "command.doctor"));
+        assert!(
+            output
+                .iter()
+                .any(|event| event.kind == "investigation.triage")
+        );
+        let binary_stage = output
+            .iter()
+            .find(|event| {
+                event.kind == "assisted.session.stage"
+                    && event
+                        .evidence
+                        .iter()
+                        .any(|item| item.label == "step_index" && item.value == "4")
+            })
+            .unwrap();
+        assert!(binary_stage.evidence.iter().any(|item| {
+            item.label == "status" && matches!(item.value.as_str(), "complete" | "error")
+        }));
+        let complete = output.last().unwrap();
+        let succeeded: usize = complete
+            .evidence
+            .iter()
+            .find(|item| item.label == "succeeded")
+            .unwrap()
+            .value
+            .parse()
+            .unwrap();
+        let failed: usize = complete
+            .evidence
+            .iter()
+            .find(|item| item.label == "failed")
+            .unwrap()
+            .value
+            .parse()
+            .unwrap();
+        assert_eq!(succeeded + failed, 6);
         assert!(output.iter().all(|event| event.kind != "prepared.input"));
         std::fs::remove_file(path).unwrap();
     }

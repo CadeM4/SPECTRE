@@ -1,6 +1,14 @@
-use std::{collections::HashSet, net::IpAddr};
+use std::{
+    collections::HashSet,
+    fs,
+    net::IpAddr,
+    path::{Path, PathBuf},
+};
 
-use crate::config::{Config, normalize_target};
+use crate::{
+    analysis::binary::MAX_BINARY_BYTES,
+    config::{Config, normalize_target},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Scenario {
@@ -30,7 +38,7 @@ pub enum Execution {
 
 /// Built-in sessions are available even when no prepared text has been configured.
 /// The scenarios describe actions; constructing them performs no analysis or I/O
-/// beyond resolving the current executable path.
+/// beyond resolving the current executable and checking candidate file sizes.
 pub fn scenarios(config: &Config) -> Vec<Scenario> {
     let mut available = vec![local_research()];
     let mut seen_targets = HashSet::new();
@@ -50,9 +58,19 @@ pub fn scenarios(config: &Config) -> Vec<Scenario> {
 }
 
 fn local_research() -> Scenario {
-    let executable = std::env::current_exe()
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "/bin/ls".to_owned());
+    let (executable, current_process) =
+        choose_binary_path(std::env::current_exe().ok(), platform_executable());
+    let binary_context = if current_process {
+        format!(
+            "Inspect the SPECTRE executable running this session: {}.",
+            executable.display()
+        )
+    } else {
+        format!(
+            "Inspect a local platform executable: {}.",
+            executable.display()
+        )
+    };
 
     Scenario {
         id: "local-research".to_owned(),
@@ -81,8 +99,8 @@ fn local_research() -> Scenario {
             ),
             step(
                 "Binary inspection",
-                "Inspect the real executable running this SPECTRE session.",
-                format!("binary {}", quote_argument(&executable)),
+                binary_context,
+                format!("binary {}", quote_argument(&executable.to_string_lossy())),
                 Execution::Local,
             ),
             step(
@@ -99,6 +117,37 @@ fn local_research() -> Scenario {
             ),
         ],
     }
+}
+
+fn fits_binary_budget(path: &Path) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= MAX_BINARY_BYTES)
+}
+
+fn choose_binary_path(current: Option<PathBuf>, fallback: Option<PathBuf>) -> (PathBuf, bool) {
+    match current {
+        Some(path) if fits_binary_budget(&path) => (path, true),
+        Some(path) => match fallback.filter(|candidate| fits_binary_budget(candidate)) {
+            Some(candidate) => (candidate, false),
+            None => (path, true),
+        },
+        None => (fallback.unwrap_or_else(|| PathBuf::from("spectre")), false),
+    }
+}
+
+#[cfg(unix)]
+fn platform_executable() -> Option<PathBuf> {
+    Some(PathBuf::from("/bin/ls"))
+}
+
+#[cfg(windows)]
+fn platform_executable() -> Option<PathBuf> {
+    std::env::var_os("SystemRoot").map(|root| PathBuf::from(root).join("System32").join("cmd.exe"))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_executable() -> Option<PathBuf> {
+    None
 }
 
 fn scoped_network(target: &str) -> Scenario {
@@ -195,8 +244,16 @@ fn quote_argument(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Execution, scenarios};
+    use super::{
+        Execution, choose_binary_path, fits_binary_budget, platform_executable, scenarios,
+    };
+    use crate::analysis::binary::MAX_BINARY_BYTES;
     use crate::{command::tokenize, config::Config};
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn local_research_is_ready_without_configuration() {
@@ -214,10 +271,54 @@ mod tests {
         assert_eq!(local.steps[0].input, "doctor");
         let binary = tokenize(&local.steps[3].input).unwrap();
         assert_eq!(binary[0], "binary");
-        assert_eq!(
-            binary[1],
-            std::env::current_exe().unwrap().to_string_lossy()
+        let selected = PathBuf::from(&binary[1]);
+        let current = std::env::current_exe().unwrap();
+        if fits_binary_budget(&current) {
+            assert_eq!(selected, current);
+            assert!(local.steps[3].context.contains("SPECTRE executable"));
+        } else if let Some(fallback) = platform_executable().filter(|path| fits_binary_budget(path))
+        {
+            assert_eq!(selected, fallback);
+            assert!(local.steps[3].context.contains("platform executable"));
+        } else {
+            assert_eq!(selected, current);
+        }
+        assert!(
+            local.steps[3]
+                .context
+                .contains(&selected.to_string_lossy().to_string())
         );
+    }
+
+    #[test]
+    fn oversized_executable_uses_small_platform_candidate() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("spectre-assisted-{}-{nonce}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let oversized = directory.join("oversized");
+        let small = directory.join("small");
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_BINARY_BYTES + 1)
+            .unwrap();
+        fs::write(&small, b"local executable fixture").unwrap();
+
+        assert_eq!(
+            choose_binary_path(Some(oversized.clone()), Some(small.clone())),
+            (small.clone(), false)
+        );
+        assert_eq!(
+            choose_binary_path(Some(oversized.clone()), None),
+            (oversized.clone(), true)
+        );
+
+        fs::remove_file(oversized).unwrap();
+        fs::remove_file(small).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 
     #[test]
