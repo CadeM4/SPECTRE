@@ -27,7 +27,7 @@ pub struct ModuleCapability {
 
 pub fn inspect() -> CapabilityReport {
     let lan = lan::detect_lan();
-    let tools = [
+    let tools: Vec<ToolCapability> = [
         "tshark",
         "tcpdump",
         "nmap",
@@ -35,6 +35,11 @@ pub fn inspect() -> CapabilityReport {
         "gdb",
         "lldb",
         "frida",
+        "frida-trace",
+        "objdump",
+        "llvm-objdump",
+        "sample",
+        "lsof",
     ]
     .into_iter()
     .map(|name| ToolCapability {
@@ -42,6 +47,18 @@ pub fn inspect() -> CapabilityReport {
         path: find_tool(name),
     })
     .collect();
+    let has_tool = |name: &str| {
+        tools
+            .iter()
+            .any(|tool| tool.name == name && tool.path.is_some())
+    };
+    let live_capture = cfg!(any(target_os = "macos", target_os = "linux")) && has_tool("tcpdump");
+    let disasm = has_tool("objdump") || has_tool("llvm-objdump");
+    let sample = cfg!(target_os = "macos") && has_tool("sample");
+    let resources = has_tool("lsof");
+    let trace = has_tool("frida-trace");
+    let vt_key = key_configured("SPECTRE_VT_API_KEY");
+    let abuse_key = key_configured("SPECTRE_ABUSEIPDB_API_KEY");
     CapabilityReport {
         os: env::consts::OS.into(),
         arch: env::consts::ARCH.into(),
@@ -62,7 +79,17 @@ pub fn inspect() -> CapabilityReport {
             ModuleCapability {
                 name: "traffic".into(),
                 available: true,
-                detail: "passive per-interface byte and packet counters; no packet capture".into(),
+                detail: "passive per-interface byte and packet counters; live packet capture is a separate explicit action".into(),
+            },
+            ModuleCapability {
+                name: "capture".into(),
+                available: live_capture,
+                detail: if live_capture {
+                    "live bounded packet capture via tcpdump on a selected interface; capture-device permission is checked when run"
+                } else {
+                    "requires macOS or Linux and tcpdump; capture-device permission is checked when run"
+                }
+                .into(),
             },
             ModuleCapability {
                 name: "lan".into(),
@@ -76,6 +103,76 @@ pub fn inspect() -> CapabilityReport {
                 name: "binary".into(),
                 available: true,
                 detail: "offline PE, ELF, and Mach-O inspection".into(),
+            },
+            ModuleCapability {
+                name: "disasm".into(),
+                available: disasm,
+                detail: if disasm {
+                    "offline bounded instruction disassembly via objdump; the target is never executed"
+                } else {
+                    "requires objdump or llvm-objdump for offline instruction disassembly"
+                }
+                .into(),
+            },
+            ModuleCapability {
+                name: "runtime_sample".into(),
+                available: sample,
+                detail: if sample {
+                    "on-demand process stack sample; attaching to another PID may require OS permission"
+                } else {
+                    "requires macOS and the sample tool for process stack sampling"
+                }
+                .into(),
+            },
+            ModuleCapability {
+                name: "runtime_resources".into(),
+                available: resources,
+                detail: if resources {
+                    "on-demand process open-file and socket inventory via lsof; OS access rules apply"
+                } else {
+                    "requires lsof for process open-file and socket inventory"
+                }
+                .into(),
+            },
+            ModuleCapability {
+                name: "runtime_trace".into(),
+                available: trace,
+                detail: if trace {
+                    "optional on-demand function trace via frida-trace; process-attach permission is required"
+                } else {
+                    "install frida-tools to enable optional on-demand function tracing"
+                }
+                .into(),
+            },
+            ModuleCapability {
+                name: "intel_cisa_kev".into(),
+                available: true,
+                detail: "keyless CISA Known Exploited Vulnerabilities lookup for CVEs; remote service checked only when queried".into(),
+            },
+            ModuleCapability {
+                name: "intel_circl".into(),
+                available: true,
+                detail: "keyless CIRCL hashlookup for file hashes; remote service checked only when queried".into(),
+            },
+            ModuleCapability {
+                name: "intel_virustotal".into(),
+                available: vt_key,
+                detail: if vt_key {
+                    "VirusTotal key configured for explicit IP, domain, and hash lookups; remote service not yet checked"
+                } else {
+                    "set SPECTRE_VT_API_KEY for explicit IP, domain, and hash lookups"
+                }
+                .into(),
+            },
+            ModuleCapability {
+                name: "intel_abuseipdb".into(),
+                available: abuse_key,
+                detail: if abuse_key {
+                    "AbuseIPDB key configured for explicit IP lookups; remote service not yet checked"
+                } else {
+                    "set SPECTRE_ABUSEIPDB_API_KEY for explicit IP lookups"
+                }
+                .into(),
             },
             ModuleCapability {
                 name: "pcap".into(),
@@ -97,19 +194,109 @@ pub fn inspect() -> CapabilityReport {
 }
 
 fn find_tool(name: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
+    let standard_paths: &[&str] = match name {
+        "tcpdump" => &["/usr/sbin/tcpdump", "/usr/bin/tcpdump"],
+        "objdump" => &["/usr/bin/objdump"],
+        "sample" => &["/usr/bin/sample"],
+        "lsof" => &["/usr/sbin/lsof", "/usr/bin/lsof"],
+        _ => &[],
+    };
+    for path in standard_paths {
+        let entry = PathBuf::from(path);
+        if entry.is_file() {
+            return Some(entry);
+        }
+    }
     let candidates: Vec<String> = if cfg!(windows) {
         vec![name.into(), format!("{name}.exe"), format!("{name}.cmd")]
     } else {
         vec![name.into()]
     };
-    for directory in env::split_paths(&path) {
-        for candidate in &candidates {
-            let entry = directory.join(candidate);
+    if let Some(path) = env::var_os("PATH") {
+        for directory in env::split_paths(&path) {
+            for candidate in &candidates {
+                let entry = directory.join(candidate);
+                if entry.is_file() {
+                    return Some(entry);
+                }
+            }
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        for candidate in candidates {
+            let entry = home.join(".local/bin").join(candidate);
             if entry.is_file() {
                 return Some(entry);
             }
         }
     }
     None
+}
+
+fn key_configured(name: &str) -> bool {
+    env::var(name).is_ok_and(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inspect;
+
+    #[test]
+    fn doctor_reports_new_capabilities_with_matching_tool_state() {
+        let report = inspect();
+        let tool_present = |name: &str| {
+            report
+                .tools
+                .iter()
+                .any(|tool| tool.name == name && tool.path.is_some())
+        };
+        let module = |name: &str| {
+            report
+                .modules
+                .iter()
+                .find(|module| module.name == name)
+                .unwrap_or_else(|| panic!("missing {name} doctor module"))
+        };
+        assert_eq!(
+            module("disasm").available,
+            tool_present("objdump") || tool_present("llvm-objdump")
+        );
+        assert_eq!(module("runtime_resources").available, tool_present("lsof"));
+        assert_eq!(
+            module("runtime_trace").available,
+            tool_present("frida-trace")
+        );
+        assert_eq!(
+            module("runtime_sample").available,
+            cfg!(target_os = "macos") && tool_present("sample")
+        );
+        assert_eq!(
+            module("capture").available,
+            cfg!(any(target_os = "macos", target_os = "linux")) && tool_present("tcpdump")
+        );
+        assert!(module("intel_cisa_kev").available);
+        assert!(module("intel_circl").available);
+    }
+
+    #[test]
+    fn doctor_distinguishes_key_presence_from_keyless_sources() {
+        let report = inspect();
+        let module = |name: &str| {
+            report
+                .modules
+                .iter()
+                .find(|module| module.name == name)
+                .unwrap_or_else(|| panic!("missing {name} doctor module"))
+        };
+        assert_eq!(
+            module("intel_virustotal").available,
+            super::key_configured("SPECTRE_VT_API_KEY")
+        );
+        assert_eq!(
+            module("intel_abuseipdb").available,
+            super::key_configured("SPECTRE_ABUSEIPDB_API_KEY")
+        );
+        assert!(module("intel_cisa_kev").detail.contains("keyless"));
+        assert!(module("intel_circl").detail.contains("keyless"));
+    }
 }

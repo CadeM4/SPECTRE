@@ -393,6 +393,22 @@ impl TuiState {
             "lan.tcp_open" => event_evidence(&observation, "endpoint")
                 .map(|endpoint| (format!("endpoint:{endpoint}"), Scene::Network)),
             "indicator.match" => Some((format!("indicator:{}", observation.id), Scene::Timeline)),
+            "capture.summary"
+            | "capture.dns_question"
+            | "capture.tls_sni"
+            | "capture.http_host" => Some((format!("capture:{}", observation.id), Scene::Capture)),
+            "disasm.summary" => Some((format!("disasm:{}", observation.id), Scene::Disassembly)),
+            "runtime.sample" | "runtime.resources" | "runtime.trace_summary" => {
+                Some((format!("runtime:{}", observation.id), Scene::Runtime))
+            }
+            kind if kind.starts_with("intel.")
+                && !matches!(
+                    kind,
+                    "intel.status" | "intel.enrich_complete" | "intel.enrich_error"
+                ) =>
+            {
+                Some((format!("intel:{}", observation.id), Scene::Intel))
+            }
             _ => None,
         };
         let new_discovery = spotlight.as_ref().is_some_and(|(key, _)| {
@@ -560,7 +576,8 @@ impl TuiState {
                 let phase = event_evidence(event, "phase").unwrap_or("stage");
                 let command = event_evidence(event, "command").unwrap_or("");
                 self.focus_scene(scene_for_command(command));
-                let failed = event_evidence(event, "status") == Some("error");
+                let stage_status = event_evidence(event, "status");
+                let failed = matches!(stage_status, Some("error" | "partial"));
                 if failed {
                     self.failed_session_stages
                         .insert((scenario_id.to_owned(), index));
@@ -588,7 +605,11 @@ impl TuiState {
                 self.status = format!(
                     "{} session {index}/{count}: {phase} {}",
                     session_label(scenario_id),
-                    if failed { "failed" } else { "complete" }
+                    match stage_status {
+                        Some("partial") => "partial",
+                        Some("error") => "failed",
+                        _ => "complete",
+                    }
                 );
             }
             "assisted.session.complete" | "assisted.session.error" => {
@@ -652,11 +673,15 @@ impl TuiState {
                     return;
                 }
                 let phase = event_evidence(event, "phase").unwrap_or("check");
-                let failed = event_evidence(event, "status") == Some("error");
+                let stage_status = event_evidence(event, "status");
                 self.status = format!(
                     "Live follow-up {} · {phase} {}",
                     self.watch_cycle,
-                    if failed { "failed" } else { "complete" }
+                    match stage_status {
+                        Some("partial") => "partial",
+                        Some("error") => "failed",
+                        _ => "complete",
+                    }
                 );
             }
             "assisted.watch.complete" | "assisted.watch.error" => {
@@ -905,8 +930,8 @@ impl TuiState {
         }
         if self.scene_auto
             && self.manual_scene_until.is_none()
-            && self.running_session.is_none()
-            && now.duration_since(self.last_scene_change) >= Duration::from_secs(7)
+            && now.duration_since(self.last_scene_change)
+                >= Duration::from_secs(if self.running_session.is_some() { 5 } else { 7 })
         {
             let available = self.projection.available_scenes();
             if available.len() > 1 {
@@ -1546,7 +1571,15 @@ fn session_label(scenario_id: &str) -> &'static str {
 }
 
 fn scene_for_command(command: &str) -> Scene {
-    if command.starts_with("lan ")
+    if command.starts_with("capture ") {
+        Scene::Capture
+    } else if command.starts_with("runtime ") {
+        Scene::Runtime
+    } else if command.starts_with("disasm ") {
+        Scene::Disassembly
+    } else if command.starts_with("intel ") {
+        Scene::Intel
+    } else if command.starts_with("lan ")
         || command.starts_with("scan ")
         || command.starts_with("investigate ")
         || command.starts_with("http ")
@@ -2129,13 +2162,7 @@ fn render_assisted_watch_input(
     } else {
         "Press F7 to resume live follow-ups".to_string()
     };
-    let available = state
-        .projection
-        .available_scenes()
-        .iter()
-        .map(|scene| scene.label())
-        .collect::<Vec<_>>()
-        .join("  /  ");
+    let carousel = assisted_scene_carousel(state, area.width.saturating_sub(4) as usize);
     let lines = vec![
         Line::from(vec![
             Span::styled(
@@ -2151,10 +2178,7 @@ fn render_assisted_watch_input(
             format!("Current screen: {}", state.scene.label()),
             Style::default().fg(palette.accent),
         )),
-        Line::from(Span::styled(
-            truncate(&available, area.width.saturating_sub(4) as usize),
-            Style::default().fg(palette.muted),
-        )),
+        Line::from(Span::styled(carousel, Style::default().fg(palette.muted))),
         Line::from(Span::styled(next_check, Style::default().fg(palette.text))),
         Line::from(Span::styled(
             "F3 browse  ·  Up/Down scroll  ·  F8 auto views  ·  F7 pause/resume",
@@ -2167,6 +2191,38 @@ fn render_assisted_watch_input(
             .block(panel_block(" ASSISTED / LIVE INVESTIGATION ", palette)),
         area,
     );
+}
+
+fn assisted_scene_carousel(state: &TuiState, max_width: usize) -> String {
+    let available = state.projection.available_scenes();
+    let Some(center) = available.iter().position(|scene| *scene == state.scene) else {
+        return format!(
+            "Current stage: {} · waiting for evidence",
+            state.scene.label()
+        );
+    };
+    let count = available.len();
+    if count == 1 {
+        return format!("01/01  [{}]", state.scene.label());
+    }
+    let radius = if max_width >= 104 && count >= 5 { 2 } else { 1 };
+    let mut labels = Vec::new();
+    for offset in -(radius as isize)..=(radius as isize) {
+        let index = (center as isize + offset).rem_euclid(count as isize) as usize;
+        let label = available[index].label();
+        labels.push(if offset == 0 {
+            format!("[{label}]")
+        } else {
+            label.to_owned()
+        });
+    }
+    let text = format!(
+        "{:02}/{:02}  ◀  {}  ▶",
+        center + 1,
+        count,
+        labels.join("  ·  ")
+    );
+    truncate(&text, max_width)
 }
 
 fn fit_tail(value: &str, max_width: usize) -> String {
@@ -2475,13 +2531,70 @@ mod tests {
         assert!(network.contains("NETWORK / LAN SURVEY"));
         assert!(network.contains("192.168.1.0/24"));
         assert!(!network.contains("SUBJECTS"));
-        state.running_session = None;
-        state.last_scene_change = Instant::now() - Duration::from_secs(8);
+        state.last_scene_change = Instant::now() - Duration::from_secs(6);
         let (tx, _rx) = mpsc::channel(4);
         assert!(state.tick(&tx));
         assert_ne!(state.scene, Scene::Network);
         let next = render_state_to_text(&state, 120, 30);
         assert_ne!(network, next);
+    }
+
+    #[test]
+    fn assisted_stage_commands_focus_evidence_scenes() {
+        assert_eq!(scene_for_command("capture en0"), Scene::Capture);
+        assert_eq!(scene_for_command("runtime sample 1234"), Scene::Runtime);
+        assert_eq!(scene_for_command("disasm /tmp/bin"), Scene::Disassembly);
+        assert_eq!(scene_for_command("intel cve CVE-2025-1234"), Scene::Intel);
+    }
+
+    #[test]
+    fn carousel_keeps_current_scene_readable_and_rotation_reaches_intel() {
+        let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        state.running_session = Some("system-network".into());
+        for (module, kind, subject, evidence) in [
+            ("capture", "capture.summary", "en0", ("interface", "en0")),
+            (
+                "disasm",
+                "disasm.summary",
+                "/tmp/bin",
+                ("section", "__text"),
+            ),
+            ("runtime", "runtime.resources", "pid:1234", ("pid", "1234")),
+            (
+                "intel",
+                "intel.no_record",
+                "abc123",
+                ("provider", "CIRCL hashlookup"),
+            ),
+        ] {
+            state.ingest(
+                Event::new(
+                    module,
+                    kind,
+                    "recorded observation",
+                    Some(subject.into()),
+                    Severity::Info,
+                    SourceKind::Live,
+                )
+                .with_evidence(evidence.0, evidence.1, "test"),
+            );
+        }
+        let (tx, _rx) = mpsc::channel(4);
+        let mut seen = Vec::new();
+        for _ in 0..state.projection.available_scenes().len() {
+            state.last_scene_change = Instant::now() - Duration::from_secs(6);
+            assert!(state.tick(&tx));
+            seen.push(state.scene);
+        }
+        assert!(seen.contains(&Scene::Intel));
+        state.scene = Scene::Intel;
+        for width in [76, 116] {
+            let carousel = assisted_scene_carousel(&state, width);
+            assert!(carousel.contains("[THREAT INTEL]"), "{carousel}");
+            assert!(carousel.chars().count() <= width);
+            assert!(carousel.contains("/"));
+        }
     }
 
     #[test]
@@ -2953,6 +3066,17 @@ mod tests {
         let screen = render_state_to_text(&state, 120, 30);
         assert!(screen.contains("STAGE 2/7"), "{screen}");
         assert!(screen.contains("!2 Collection"), "{screen}");
+        state.ingest(
+            assisted_event("assisted.session.stage", "local-research", 3)
+                .with_evidence("phase", "Intel lookup", "test")
+                .with_evidence("status", "partial", "test"),
+        );
+        assert!(state.status.contains("partial"));
+        assert!(
+            state
+                .failed_session_stages
+                .contains(&("local-research".to_string(), 3))
+        );
         state.ingest(
             Event::new(
                 "presentation",

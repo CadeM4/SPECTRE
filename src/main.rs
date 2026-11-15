@@ -38,6 +38,27 @@ enum Action {
         #[command(subcommand)]
         target: AnalyzeTarget,
     },
+    /// Capture live packets on a network interface and summarize flows
+    Capture {
+        #[command(subcommand)]
+        action: CaptureAction,
+    },
+    /// Disassemble a local binary into bounded instruction evidence
+    Disassemble {
+        path: PathBuf,
+        #[arg(long, default_value_t = 96)]
+        instructions: usize,
+    },
+    /// Sample stacks, inspect resources, or trace functions in a live process
+    Runtime {
+        #[command(subcommand)]
+        action: RuntimeAction,
+    },
+    /// Query an external intelligence provider for one explicit indicator
+    Intel {
+        #[command(subcommand)]
+        action: IntelAction,
+    },
     /// Connect to bounded TCP ports on a scoped target
     Scan {
         target: String,
@@ -97,6 +118,52 @@ enum Action {
 enum AnalyzeTarget {
     Binary { path: PathBuf },
     Pcap { path: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum CaptureAction {
+    Live {
+        #[arg(long, default_value = "auto")]
+        interface: String,
+        #[arg(long, default_value_t = 4)]
+        seconds: u64,
+        #[arg(long, default_value_t = 256)]
+        packets: u32,
+        #[arg(long, default_value_t = 1_536)]
+        snaplen: u32,
+        #[arg(long, default_value = "ip or ip6")]
+        filter: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RuntimeAction {
+    Resources {
+        pid: String,
+    },
+    Sample {
+        pid: String,
+        #[arg(long, default_value_t = 2)]
+        seconds: u64,
+    },
+    Trace {
+        pid: String,
+        pattern: String,
+        #[arg(long, default_value_t = 5)]
+        seconds: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum IntelAction {
+    Status,
+    /// Enrich this SPECTRE executable's observed hash
+    Enrich,
+    Query {
+        provider: String,
+        kind: String,
+        value: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -183,7 +250,16 @@ async fn main() -> Result<()> {
                 );
                 println!("Recommended profile: {}", report.recommended_profile);
                 for module in report.modules {
-                    println!("  {:<12} {}", module.name, module.detail);
+                    println!(
+                        "  {:<20} {:<11} {}",
+                        module.name,
+                        if module.available {
+                            "ready"
+                        } else {
+                            "unavailable"
+                        },
+                        module.detail
+                    );
                 }
                 for tool in report.tools {
                     println!(
@@ -260,6 +336,12 @@ async fn main() -> Result<()> {
             result?;
         }
         action => {
+            let enrich_local_executable = matches!(
+                &action,
+                Action::Intel {
+                    action: IntelAction::Enrich
+                }
+            );
             let line = match action {
                 Action::Analyze {
                     target: AnalyzeTarget::Binary { path },
@@ -267,6 +349,55 @@ async fn main() -> Result<()> {
                 Action::Analyze {
                     target: AnalyzeTarget::Pcap { path },
                 } => format!("pcap {}", quote(path.to_string_lossy().as_ref())),
+                Action::Capture {
+                    action:
+                        CaptureAction::Live {
+                            interface,
+                            seconds,
+                            packets,
+                            snaplen,
+                            filter,
+                        },
+                } => format!(
+                    "capture live {} {seconds} {packets} {snaplen} {}",
+                    quote(&interface),
+                    quote(&filter)
+                ),
+                Action::Disassemble { path, instructions } => format!(
+                    "disasm {} {instructions}",
+                    quote(path.to_string_lossy().as_ref())
+                ),
+                Action::Runtime { action } => match action {
+                    RuntimeAction::Resources { pid } => {
+                        format!("runtime resources {}", quote(&pid))
+                    }
+                    RuntimeAction::Sample { pid, seconds } => {
+                        format!("runtime sample {} {seconds}", quote(&pid))
+                    }
+                    RuntimeAction::Trace {
+                        pid,
+                        pattern,
+                        seconds,
+                    } => format!(
+                        "runtime trace {} {} {seconds}",
+                        quote(&pid),
+                        quote(&pattern)
+                    ),
+                },
+                Action::Intel { action } => match action {
+                    IntelAction::Status => "intel status".into(),
+                    IntelAction::Enrich => "intel enrich recent".into(),
+                    IntelAction::Query {
+                        provider,
+                        kind,
+                        value,
+                    } => format!(
+                        "intel query {} {} {}",
+                        quote(&provider),
+                        quote(&kind),
+                        quote(&value)
+                    ),
+                },
                 Action::Scan { target, ports } => format!(
                     "scan {} {}",
                     quote(&target),
@@ -334,10 +465,23 @@ async fn main() -> Result<()> {
                 _ => unreachable!(),
             };
             let hub = EventHub::new(2_000);
+            if enrich_local_executable {
+                let executable = std::env::current_exe().context("locate SPECTRE executable")?;
+                command::execute_line(
+                    &format!("binary {}", quote(executable.to_string_lossy().as_ref())),
+                    &hub,
+                    &config_path,
+                )
+                .await
+                .context("inspect SPECTRE executable for intelligence pivot")?;
+            }
             command::execute_line(&line, &hub, &config_path)
                 .await
                 .context("analysis failed")?;
             for event in hub.snapshot() {
+                if enrich_local_executable && event.module != "intel" {
+                    continue;
+                }
                 if json {
                     println!("{}", serde_json::to_string(&event)?);
                 } else {
