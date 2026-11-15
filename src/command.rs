@@ -2241,12 +2241,56 @@ mod tests {
                 .iter()
                 .any(|item| { item.label == "lan_enabled" && item.value == "false" })
         );
-        assert!(
-            complete
+        let succeeded: usize = complete
+            .evidence
+            .iter()
+            .find(|item| item.label == "succeeded")
+            .unwrap()
+            .value
+            .parse()
+            .unwrap();
+        let failed: usize = complete
+            .evidence
+            .iter()
+            .find(|item| item.label == "failed")
+            .unwrap()
+            .value
+            .parse()
+            .unwrap();
+        let stages: Vec<_> = output
+            .iter()
+            .filter(|event| event.kind == "assisted.watch.stage")
+            .collect();
+        assert_eq!(stages.len(), 5);
+        assert_eq!(succeeded + failed, stages.len());
+        assert_eq!(
+            succeeded,
+            stages
+                .iter()
+                .filter(|event| {
+                    event
+                        .evidence
+                        .iter()
+                        .any(|item| item.label == "status" && item.value == "complete")
+                })
+                .count()
+        );
+        assert!(stages.iter().all(|event| {
+            let status = event
                 .evidence
                 .iter()
-                .any(|item| { item.label == "failed" && item.value == "0" })
-        );
+                .find(|item| item.label == "status")
+                .map(|item| item.value.as_str());
+            matches!(status, Some("complete" | "error" | "partial"))
+                && (status == Some("complete")
+                    || event.evidence.iter().any(|item| item.label == "error"))
+        }));
+        assert!(stages.iter().any(|event| {
+            event
+                .evidence
+                .iter()
+                .any(|item| item.label == "phase" && item.value == "Live packets")
+        }));
         std::fs::remove_file(path).unwrap();
     }
 
