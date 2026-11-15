@@ -497,7 +497,9 @@ impl LiveProjection {
         let Some(address) = event.subject.as_deref() else {
             return;
         };
-        self.current_survey_hosts.insert(address.to_owned());
+        if self.current_survey_hosts.insert(address.to_owned()) {
+            self.lan_hosts.remove(address);
+        }
         let host = self
             .lan_hosts
             .entry(address.to_owned())
@@ -523,7 +525,9 @@ impl LiveProjection {
         let Some(port) = field(event, "port").and_then(|value| value.parse::<u16>().ok()) else {
             return;
         };
-        self.current_survey_hosts.insert(address.to_owned());
+        if self.current_survey_hosts.insert(address.to_owned()) {
+            self.lan_hosts.remove(address);
+        }
         let host = self
             .lan_hosts
             .entry(address.to_owned())
@@ -2381,6 +2385,63 @@ mod tests {
         data.ingest(&second_completion);
         assert!(data.lan_hosts.is_empty());
         assert!(render_text(Scene::Network, &data, 120, 20).contains("No host has answered"));
+    }
+
+    #[test]
+    fn resurvey_replaces_old_ports_and_web_status_for_same_host() {
+        let mut data = LiveProjection::default();
+        let host = || {
+            Event::new(
+                "lan",
+                "lan.host",
+                "Host answered",
+                Some("192.168.1.4".into()),
+                Severity::Info,
+                SourceKind::Live,
+            )
+        };
+        let open = |port: &str| {
+            Event::new(
+                "lan",
+                "lan.tcp_open",
+                format!("TCP {port} open"),
+                Some("192.168.1.4".into()),
+                Severity::Info,
+                SourceKind::Live,
+            )
+            .with_evidence("port", port, "test")
+        };
+        let complete = || {
+            Event::new(
+                "lan",
+                "lan.survey_complete",
+                "Survey complete",
+                Some("192.168.1.0/24".into()),
+                Severity::Info,
+                SourceKind::Live,
+            )
+        };
+        data.ingest(&host());
+        data.ingest(&open("443"));
+        data.ingest(&complete());
+        data.ingest(
+            &Event::new(
+                "web",
+                "http_response",
+                "HTTP 200",
+                Some("192.168.1.4".into()),
+                Severity::Info,
+                SourceKind::Live,
+            )
+            .with_evidence("local_segment", "192.168.1.0/24", "test")
+            .with_evidence("status", "200", "test"),
+        );
+        data.ingest(&host());
+        data.ingest(&open("80"));
+        data.ingest(&complete());
+        let current = data.lan_hosts.get("192.168.1.4").unwrap();
+        assert_eq!(current.ports.iter().copied().collect::<Vec<_>>(), vec![80]);
+        assert!(current.web_status.is_none());
     }
 
     #[test]
