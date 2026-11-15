@@ -6,7 +6,7 @@ use crate::{
     detection::Indicator,
     engine::EventHub,
     model::{Event, Severity, SourceKind},
-    network,
+    network, process, traffic,
 };
 use anyhow::{Context, Result, bail};
 use std::{
@@ -33,7 +33,7 @@ pub enum WorkspaceRequest {
         index: usize,
         text: String,
     },
-    AssistedRunLocalSession {
+    AssistedRunSession {
         scenario_id: String,
     },
 }
@@ -99,11 +99,7 @@ pub async fn execute_workspace_request(
             text,
         } => match run_scoped_assisted_step(&scenario_id, index, &text, hub, config_path).await {
             Ok(mut output) => {
-                let result_ids = output
-                    .iter()
-                    .map(|event| event.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",");
+                let (result_ids, omitted) = retained_result_ids(hub, &output);
                 let acknowledgement = assisted_ack(
                     "assisted.run.complete",
                     "Scoped assisted action completed",
@@ -112,7 +108,17 @@ pub async fn execute_workspace_request(
                     Severity::Info,
                 )
                 .with_evidence("command", &text, "assisted_scenario")
-                .with_evidence("result_event_ids", result_ids, "observed_results");
+                .with_evidence("result_event_ids", result_ids, "retained_results")
+                .with_evidence(
+                    "result_event_count",
+                    output.len().to_string(),
+                    "observed_results",
+                )
+                .with_evidence(
+                    "uncited_result_count",
+                    omitted.to_string(),
+                    "bounded_provenance",
+                );
                 hub.publish(acknowledgement.clone());
                 output.push(acknowledgement);
                 Ok(output)
@@ -131,14 +137,14 @@ pub async fn execute_workspace_request(
                 Ok(vec![acknowledgement])
             }
         },
-        WorkspaceRequest::AssistedRunLocalSession { scenario_id } => {
-            match run_full_local_assisted_session(&scenario_id, hub, config_path).await {
+        WorkspaceRequest::AssistedRunSession { scenario_id } => {
+            match run_full_assisted_session(&scenario_id, hub, config_path).await {
                 Ok(output) => Ok(output),
                 Err(error) => {
                     let acknowledgement = Event::new(
                         "presentation",
                         "assisted.session.error",
-                        format!("Local assisted session failed: {error}"),
+                        format!("Assisted session failed: {error}"),
                         None,
                         Severity::Low,
                         SourceKind::Derived,
@@ -170,6 +176,31 @@ fn assisted_ack(
     )
     .with_evidence("scenario", scenario_id, "assisted_scenario")
     .with_evidence("step_index", index.to_string(), "assisted_scenario")
+}
+
+const MAX_ASSISTED_RESULT_REFS: usize = 8;
+
+fn retained_result_ids(hub: &EventHub, results: &[Event]) -> (String, usize) {
+    // Cite only recent results. A stage may produce more events than the hub's
+    // retention capacity; citing an evicted ID would make the marker itself
+    // disappear, leaving the TUI waiting for an acknowledgement.
+    let recent = hub
+        .snapshot()
+        .into_iter()
+        .rev()
+        .take(32)
+        .map(|event| event.id)
+        .collect::<HashSet<_>>();
+    let mut ids = results
+        .iter()
+        .rev()
+        .filter(|event| recent.contains(&event.id))
+        .take(MAX_ASSISTED_RESULT_REFS)
+        .map(|event| event.id.as_str())
+        .collect::<Vec<_>>();
+    ids.reverse();
+    let omitted = results.len().saturating_sub(ids.len());
+    (ids.join(","), omitted)
 }
 
 fn assisted_scenario(scenario_id: &str, config_path: &Path) -> Result<assisted::Scenario> {
@@ -216,12 +247,8 @@ async fn complete_assisted_step(
     let mut output = vec![prepared];
     if step.execution == Execution::Local {
         let results = execute_line(text, hub, config_path).await?;
-        let event_ids = results
-            .iter()
-            .map(|event| event.id.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        let completion = assisted_ack(
+        let (event_ids, omitted) = retained_result_ids(hub, &results);
+        let mut completion = assisted_ack(
             "assisted.action",
             format!("{} · {} completed", scenario.title, step.phase),
             &scenario.id,
@@ -229,8 +256,32 @@ async fn complete_assisted_step(
             Severity::Info,
         )
         .with_evidence("command", text, "assisted_scenario")
-        .with_evidence("prepared_event_id", prepared_id, "event id")
-        .with_evidence("result_event_ids", event_ids, "observed_results");
+        .with_evidence("result_event_ids", event_ids, "retained_results")
+        .with_evidence(
+            "result_event_count",
+            results.len().to_string(),
+            "observed_results",
+        )
+        .with_evidence(
+            "uncited_result_count",
+            omitted.to_string(),
+            "bounded_provenance",
+        );
+        if hub
+            .snapshot()
+            .iter()
+            .rev()
+            .take(32)
+            .any(|event| event.id == prepared_id)
+        {
+            completion = completion.with_evidence("prepared_event_id", prepared_id, "event id");
+        } else {
+            completion = completion.with_evidence(
+                "expired_prepared_event_id",
+                prepared_id,
+                "bounded_history",
+            );
+        }
         hub.publish(completion.clone());
         output.extend(results);
         output.push(completion);
@@ -260,20 +311,26 @@ async fn run_scoped_assisted_step(
     execute_line(text, hub, config_path).await
 }
 
-async fn run_full_local_assisted_session(
+async fn run_full_assisted_session(
     scenario_id: &str,
     hub: &EventHub,
     config_path: &Path,
 ) -> Result<Vec<Event>> {
     let scenario = assisted_scenario(scenario_id, config_path)?;
-    if scenario.id != "local-research"
-        || scenario.steps.is_empty()
+    if !matches!(
+        scenario.id.as_str(),
+        "system-network" | "local-research" | "local-network" | "process-investigation"
+    ) && !scenario.id.starts_with("scoped-network:")
+    {
+        bail!("only built-in scenarios support a full run");
+    }
+    if scenario.steps.is_empty()
         || scenario
             .steps
             .iter()
-            .any(|step| step.execution != Execution::Local)
+            .any(|step| step.execution == Execution::PresentationOnly)
     {
-        bail!("only the bundled local research scenario supports a full run");
+        bail!("scenario has no executable stages");
     }
     let started = Event::new(
         "presentation",
@@ -292,12 +349,30 @@ async fn run_full_local_assisted_session(
     hub.publish(started.clone());
     let mut output = vec![started];
     let mut succeeded = 0usize;
+    let mut current_lan_survey_id: Option<String> = None;
     for (position, step) in scenario.steps.iter().enumerate() {
         let index = position + 1;
-        let result = if is_safe_local_assisted_command(&step.input)? {
-            execute_line(&step.input, hub, config_path).await
+        let result = if step.input == "lan report" {
+            match current_lan_survey_id.as_deref() {
+                Some(survey_id) => lan_report(&hub.snapshot(), Some(survey_id)).map(|report| {
+                    hub.publish(report.clone());
+                    vec![report]
+                }),
+                None => Err(anyhow::anyhow!(
+                    "no successful LAN survey in this session to review"
+                )),
+            }
         } else {
-            anyhow::bail!("bundled local stage is not an approved read-only command")
+            match step.execution {
+                Execution::Local if is_safe_local_assisted_command(&step.input)? => {
+                    execute_line(&step.input, hub, config_path).await
+                }
+                Execution::Explicit if is_scoped_assisted_command(&step.input)? => {
+                    run_scoped_assisted_step(&scenario.id, index, &step.input, hub, config_path)
+                        .await
+                }
+                _ => anyhow::bail!("bundled stage has an unsupported action"),
+            }
         };
         let mut stage = assisted_ack(
             "assisted.session.stage",
@@ -310,18 +385,33 @@ async fn run_full_local_assisted_session(
         .with_evidence("command", &step.input, "assisted_scenario");
         match result {
             Ok(events) => {
+                if step.input.starts_with("lan survey") {
+                    current_lan_survey_id = events
+                        .iter()
+                        .find(|event| event.module == "lan" && event.kind == "lan.survey_complete")
+                        .map(|event| event.id.clone());
+                }
                 succeeded += 1;
-                let event_ids = events
-                    .iter()
-                    .map(|event| event.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",");
+                let (event_ids, omitted) = retained_result_ids(hub, &events);
                 stage = stage
                     .with_evidence("status", "complete", "execution")
-                    .with_evidence("result_event_ids", event_ids, "observed_results");
+                    .with_evidence("result_event_ids", event_ids, "retained_results")
+                    .with_evidence(
+                        "result_event_count",
+                        events.len().to_string(),
+                        "observed_results",
+                    )
+                    .with_evidence(
+                        "uncited_result_count",
+                        omitted.to_string(),
+                        "bounded_provenance",
+                    );
                 output.extend(events);
             }
             Err(error) => {
+                if step.input.starts_with("lan survey") {
+                    current_lan_survey_id = None;
+                }
                 stage.severity = Severity::Low;
                 stage = stage
                     .with_evidence("status", "error", "execution")
@@ -369,7 +459,7 @@ pub async fn execute_line(line: &str, hub: &EventHub, config_path: &Path) -> Res
     hub.set_indicators(canonical_indicators.clone());
     let output = match words[0].as_str() {
         "help" => vec![Event::new("command", "command.help", "Command reference (F1 for keyboard controls)", None, Severity::Info, SourceKind::Live)
-            .with_evidence("commands", "binary <file>\npcap <file>\nscan <target> [ports]\ninvestigate <target> [ports]\nhttp <url>\nscope add|remove|list\nindicator add|remove|list\nprofile <name>|list\ntheme <name>|list\nmodule enable|disable|list\nautonomous on|off\nworkflow list|add|remove|clear\nretention [set COUNT]\ntriage\nexport <file>\ndoctor", "built_in")],
+            .with_evidence("commands", "binary <file>\npcap <file>\nprocess top [limit]|inspect <PID|self>\ntraffic snapshot\nscan <target> [ports]\ninvestigate <target> [ports]\nhttp <url>\nlan status|survey [detected CIDR]|report|on|off\nscope add|remove|list\nindicator add|remove|list\nprofile <name>|list\ntheme <name>|list\nmodule enable|disable|list\nautonomous on|off\nworkflow list|add|remove|clear\nretention [set COUNT]\ntriage\nexport <file>\ndoctor", "built_in")],
         "doctor" => {
             let report = capability::inspect();
             let found = report.tools.iter().filter(|tool| tool.path.is_some()).count();
@@ -379,6 +469,31 @@ pub async fn execute_line(line: &str, hub: &EventHub, config_path: &Path) -> Res
         "binary" if words.len() == 2 => {
             let path = PathBuf::from(&words[1]);
             tokio::task::spawn_blocking(move || analysis::analyze_binary(&path)).await??
+        }
+        "process" if words.len() >= 2 => match words[1].as_str() {
+            "top" if (2..=3).contains(&words.len()) => {
+                let limit = words
+                    .get(2)
+                    .map(|value| value.parse::<usize>())
+                    .transpose()
+                    .context("process top limit must be a number")?
+                    .unwrap_or(10);
+                tokio::task::spawn_blocking(move || process::top_processes(limit)).await??
+            }
+            "inspect" if words.len() == 3 => {
+                let pid = if words[2] == "self" {
+                    std::process::id()
+                } else {
+                    words[2]
+                        .parse::<u32>()
+                        .context("process inspect expects a numeric PID or self")?
+                };
+                tokio::task::spawn_blocking(move || process::inspect_process(pid)).await??
+            }
+            _ => bail!("usage: process top [1..32], or process inspect <PID|self>"),
+        },
+        "traffic" if words.len() == 2 && words[1] == "snapshot" => {
+            tokio::task::spawn_blocking(traffic::traffic_snapshot).await??
         }
         "triage" if words.len() == 1 => vec![triage_snapshot(&hub.snapshot())],
         "pcap" if words.len() == 2 => {
@@ -468,6 +583,57 @@ pub async fn execute_line(line: &str, hub: &EventHub, config_path: &Path) -> Res
             }
             network::inspect_http(&words[1], Duration::from_secs(8)).await?
         }
+        "lan" if words.len() >= 2 => match words[1].as_str() {
+            "status" if words.len() == 2 => {
+                let scope = network::lan::detect_lan()?;
+                vec![Event::new(
+                    "lan",
+                    "lan.status",
+                    format!(
+                        "Active private IPv4 segment {} on {} ({})",
+                        scope.cidr, scope.interface, scope.local_ip
+                    ),
+                    Some(scope.cidr.clone()),
+                    Severity::Info,
+                    SourceKind::Live,
+                )
+                .with_evidence("interface", scope.interface, "interface_inventory")
+                .with_evidence("local_ip", scope.local_ip.to_string(), "interface_inventory")
+                .with_evidence("cidr", scope.cidr, "interface_netmask")
+                .with_evidence("survey_enabled", config.lan_assessment_enabled.to_string(), "config.toml")]
+            }
+            "survey" if (2..=3).contains(&words.len()) => {
+                if !config.lan_assessment_enabled {
+                    bail!("local network assessment is off; use `lan on` or F5 then n");
+                }
+                let scope = network::lan::detect_lan()?;
+                if let Some(expected) = words.get(2)
+                    && expected != &scope.cidr
+                {
+                    bail!(
+                        "active local segment changed from {expected} to {}; review the new target before surveying",
+                        scope.cidr
+                    );
+                }
+                network::lan::survey_lan(&scope).await?
+            }
+            "report" if words.len() == 2 => vec![lan_report(&hub.snapshot(), None)?],
+            "on" | "off" if words.len() == 2 => {
+                let mut next = config;
+                next.lan_assessment_enabled = words[1] == "on";
+                next.save(config_path)?;
+                vec![Event::new(
+                    "config",
+                    "config.lan_assessment",
+                    format!("Local network assessment: {}", words[1]),
+                    None,
+                    Severity::Info,
+                    SourceKind::Live,
+                )
+                .with_evidence("enabled", next.lan_assessment_enabled.to_string(), "config.toml")]
+            }
+            _ => bail!("usage: lan status|survey [detected CIDR]|report|on|off"),
+        },
         "scope" if words.len() >= 2 => match words[1].as_str() {
             "list" if words.len() == 2 => vec![status(if config.allowed_targets.is_empty() {
                 "No targets configured".into()
@@ -534,7 +700,7 @@ pub async fn execute_line(line: &str, hub: &EventHub, config_path: &Path) -> Res
             }
         }
         "module" if words.len() >= 2 => {
-            let available = ["host", "process", "binary", "correlation"];
+            let available = ["host", "process", "binary", "traffic", "correlation"];
             match words[1].as_str() {
                 "list" if words.len() == 2 => vec![status(format!(
                     "Autonomous modules: {}; enabled: {}",
@@ -680,8 +846,17 @@ fn is_safe_local_assisted_command(line: &str) -> Result<bool> {
         [command, action] => {
             matches!(
                 (command.as_str(), action.as_str()),
-                ("module", "list") | ("indicator", "list") | ("scope", "list")
+                ("module", "list")
+                    | ("indicator", "list")
+                    | ("scope", "list")
+                    | ("lan", "status")
+                    | ("lan", "report")
+                    | ("process", "top")
+                    | ("traffic", "snapshot")
             ) || command == "binary"
+        }
+        [command, action, target] => {
+            command == "process" && action == "inspect" && target == "self"
         }
         _ => false,
     })
@@ -690,6 +865,8 @@ fn is_safe_local_assisted_command(line: &str) -> Result<bool> {
 fn is_scoped_assisted_command(line: &str) -> Result<bool> {
     let words = tokenize(line)?;
     Ok(match words.as_slice() {
+        [command, action] if command == "lan" && action == "survey" => true,
+        [command, action, _cidr] if command == "lan" && action == "survey" => true,
         [command, _target] => matches!(command.as_str(), "scan" | "investigate" | "http"),
         [command, _target, _ports] => matches!(command.as_str(), "scan" | "investigate"),
         _ => false,
@@ -703,7 +880,15 @@ fn triage_snapshot(events: &[Event]) -> Event {
         .filter(|event| {
             matches!(
                 event.module.as_str(),
-                "host" | "process" | "binary" | "pcap" | "tcp" | "http" | "investigation"
+                "host"
+                    | "process"
+                    | "binary"
+                    | "pcap"
+                    | "tcp"
+                    | "http"
+                    | "lan"
+                    | "traffic"
+                    | "investigation"
             )
         })
         .collect::<Vec<_>>();
@@ -765,6 +950,113 @@ fn triage_snapshot(events: &[Event]) -> Event {
     .with_evidence("subject_links", subject_links.to_string(), "retained_events")
     .with_evidence("recent_subjects", recent_subjects, "retained_observations")
     .with_evidence("recent_observation_ids", recent_ids, "retained_observations")
+}
+
+fn lan_report(events: &[Event], expected_survey_id: Option<&str>) -> Result<Event> {
+    let Some(last_index) = events
+        .iter()
+        .rposition(|event| event.module == "lan" && event.kind == "lan.survey_complete")
+    else {
+        if expected_survey_id.is_some() {
+            bail!("current LAN survey is no longer retained; run the survey again");
+        }
+        return Ok(Event::new(
+            "investigation",
+            "lan.report",
+            "No local network survey results retained",
+            None,
+            Severity::Info,
+            SourceKind::Derived,
+        ));
+    };
+    let prior_index = events[..last_index]
+        .iter()
+        .rposition(|event| event.module == "lan" && event.kind == "lan.survey_complete");
+    let survey = &events[last_index];
+    if expected_survey_id.is_some_and(|expected| expected != survey.id.as_str()) {
+        bail!("current LAN survey is no longer retained; run the survey again");
+    }
+    let results = &events[prior_index.map_or(0, |index| index + 1)..last_index];
+    let hosts = results
+        .iter()
+        .filter(|event| event.module == "lan" && event.kind == "lan.host")
+        .collect::<Vec<_>>();
+    let open_endpoints = results
+        .iter()
+        .filter(|event| event.module == "lan" && event.kind == "lan.tcp_open")
+        .collect::<Vec<_>>();
+    let host_list = hosts
+        .iter()
+        .filter_map(|event| event.subject.as_deref())
+        .take(32)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let endpoint_list = open_endpoints
+        .iter()
+        .filter_map(|event| event.evidence.iter().find(|item| item.label == "endpoint"))
+        .map(|item| item.value.as_str())
+        .take(32)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let reported_hosts = survey
+        .evidence
+        .iter()
+        .find(|item| item.label == "responded_hosts")
+        .map(|item| item.value.as_str())
+        .unwrap_or("unknown");
+    let reported_endpoints = survey
+        .evidence
+        .iter()
+        .find(|item| item.label == "open_endpoints")
+        .map(|item| item.value.as_str())
+        .unwrap_or("unknown");
+    let web_summary = events[last_index + 1..]
+        .iter()
+        .find(|event| event.module == "lan" && event.kind == "lan.web_followup_complete");
+    let web_responses = web_summary
+        .and_then(|event| event.evidence.iter().find(|item| item.label == "responses"))
+        .map(|item| item.value.as_str());
+    let web_attempted = web_summary
+        .and_then(|event| {
+            event
+                .evidence
+                .iter()
+                .find(|item| item.label == "attempted_endpoints")
+        })
+        .map(|item| item.value.as_str());
+    let survey_segment = survey.subject.as_deref().unwrap_or("unknown segment");
+    let survey_time = survey.timestamp.to_rfc3339();
+    let summary = match (web_responses, web_attempted) {
+        (Some(responses), Some(attempted)) => format!(
+            "Latest retained survey of {survey_segment} at {survey_time}: {reported_hosts} responsive hosts, {reported_endpoints} open TCP endpoints, {responses}/{attempted} web responses"
+        ),
+        _ => format!(
+            "Latest retained survey of {survey_segment} at {survey_time}: {reported_hosts} responsive hosts, {reported_endpoints} open TCP endpoints"
+        ),
+    };
+    Ok(Event::new(
+        "investigation",
+        "lan.report",
+        summary,
+        survey.subject.clone(),
+        Severity::Info,
+        SourceKind::Derived,
+    )
+    .with_evidence("survey_event_id", &survey.id, "retained_survey")
+    .with_evidence("responsive_hosts", reported_hosts, "survey_summary")
+    .with_evidence("open_endpoints", reported_endpoints, "survey_summary")
+    .with_evidence("hosts_first_32", host_list, "retained_survey")
+    .with_evidence("endpoints_first_32", endpoint_list, "retained_survey")
+    .with_evidence(
+        "web_responses",
+        web_responses.unwrap_or("unknown"),
+        "web_followup",
+    )
+    .with_evidence(
+        "web_attempted",
+        web_attempted.unwrap_or("unknown"),
+        "web_followup",
+    ))
 }
 
 pub fn status(summary: impl Into<String>) -> Event {
@@ -1114,12 +1406,26 @@ mod tests {
             .iter()
             .find(|event| event.kind == "assisted.action")
             .unwrap();
-        let referenced = crate::engine::referenced_source_ids(action);
+        let prepared_id = action
+            .evidence
+            .iter()
+            .find(|item| item.label == "prepared_event_id")
+            .map(|item| item.value.as_str())
+            .unwrap();
+        let result_ids = action
+            .evidence
+            .iter()
+            .find(|item| item.label == "result_event_ids")
+            .map(|item| item.value.as_str())
+            .unwrap();
+        let referenced = std::iter::once(prepared_id)
+            .chain(result_ids.split(',').filter(|id| !id.is_empty()))
+            .collect::<Vec<_>>();
         assert_eq!(referenced.len(), 2);
         assert!(referenced.iter().all(|id| {
             output
                 .iter()
-                .any(|event| &event.id == id && event.kind != "assisted.action")
+                .any(|event| event.id == *id && event.kind != "assisted.action")
         }));
         assert_eq!(output.last().unwrap().kind, "assisted.step.complete");
         let rejected = execute_workspace_request(
@@ -1165,7 +1471,10 @@ mod tests {
         };
         config.save(&path).unwrap();
         let hub = EventHub::new(100);
-        let scenario = assisted::scenarios(&config)[1].clone();
+        let scenario = assisted::scenarios(&config)
+            .into_iter()
+            .find(|scenario| scenario.id == "scoped-network:127.0.0.1")
+            .unwrap();
         let step = scenario.steps[1].input.clone();
         let output = execute_workspace_request(
             WorkspaceRequest::AssistedStep {
@@ -1228,7 +1537,7 @@ mod tests {
         Config::default().save(&path).unwrap();
         let hub = EventHub::new(2_000);
         let output = execute_workspace_request(
-            WorkspaceRequest::AssistedRunLocalSession {
+            WorkspaceRequest::AssistedRunSession {
                 scenario_id: "local-research".into(),
             },
             &hub,
@@ -1242,7 +1551,7 @@ mod tests {
                 .iter()
                 .filter(|event| event.kind == "assisted.session.stage")
                 .count(),
-            6
+            7
         );
         assert_eq!(output.last().unwrap().kind, "assisted.session.complete");
         assert!(output.iter().any(|event| event.kind == "command.doctor"));
@@ -1258,7 +1567,7 @@ mod tests {
                     && event
                         .evidence
                         .iter()
-                        .any(|item| item.label == "step_index" && item.value == "4")
+                        .any(|item| item.label == "step_index" && item.value == "5")
             })
             .unwrap();
         assert!(binary_stage.evidence.iter().any(|item| {
@@ -1281,8 +1590,85 @@ mod tests {
             .value
             .parse()
             .unwrap();
-        assert_eq!(succeeded + failed, 6);
+        assert_eq!(succeeded + failed, 7);
         assert!(output.iter().all(|event| event.kind != "prepared.input"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_assisted_session_inspects_live_processes_with_one_request() {
+        let path = std::env::temp_dir().join(format!(
+            "spectre-process-session-test-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        Config::default().save(&path).unwrap();
+        let hub = EventHub::new(2_000);
+        let output = execute_workspace_request(
+            WorkspaceRequest::AssistedRunSession {
+                scenario_id: "process-investigation".into(),
+            },
+            &hub,
+            &path,
+        )
+        .await
+        .unwrap();
+        assert!(
+            output
+                .iter()
+                .any(|event| event.kind == "process.top_summary")
+        );
+        assert!(output.iter().any(|event| event.kind == "process.inspect"));
+        assert_eq!(
+            output
+                .iter()
+                .filter(|event| event.kind == "assisted.session.stage")
+                .count(),
+            3
+        );
+        assert_eq!(output.last().unwrap().kind, "assisted.session.complete");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_default_session_respects_lan_toggle_and_runs_other_domains() {
+        let path = std::env::temp_dir().join(format!(
+            "spectre-system-session-test-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config = Config {
+            lan_assessment_enabled: false,
+            ..Config::default()
+        };
+        config.save(&path).unwrap();
+        let hub = EventHub::new(2_000);
+        let output = execute_workspace_request(
+            WorkspaceRequest::AssistedRunSession {
+                scenario_id: "system-network".into(),
+            },
+            &hub,
+            &path,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            output
+                .iter()
+                .filter(|event| event.kind == "assisted.session.stage")
+                .count(),
+            8
+        );
+        assert!(output.iter().any(|event| event.kind == "process.inspect"));
+        assert!(output.iter().any(|event| event.kind == "traffic.snapshot"));
+        assert!(output.iter().all(|event| event.module != "lan"));
+        assert_eq!(output.last().unwrap().kind, "assisted.session.complete");
         std::fs::remove_file(path).unwrap();
     }
 
@@ -1323,6 +1709,76 @@ mod tests {
                 .iter()
                 .any(|item| { item.label == "recent_subjects" && item.value == "/bin/ls" })
         );
+    }
+
+    #[test]
+    fn lan_report_uses_survey_totals_and_labels_retained_details() {
+        let host = Event::new(
+            "lan",
+            "lan.host",
+            "host answered",
+            Some("192.168.1.2".into()),
+            Severity::Info,
+            SourceKind::Live,
+        );
+        let endpoint = Event::new(
+            "lan",
+            "lan.tcp_open",
+            "open endpoint",
+            Some("192.168.1.2".into()),
+            Severity::Info,
+            SourceKind::Live,
+        )
+        .with_evidence("endpoint", "192.168.1.2:80", "tcp_connect");
+        let completed = Event::new(
+            "lan",
+            "lan.survey_complete",
+            "survey complete",
+            Some("192.168.1.0/24".into()),
+            Severity::Info,
+            SourceKind::Live,
+        )
+        .with_evidence("responded_hosts", "3", "tcp_connect")
+        .with_evidence("open_endpoints", "4", "tcp_connect");
+        let report = lan_report(&[host, endpoint, completed.clone()], Some(&completed.id)).unwrap();
+        assert_eq!(report.kind, "lan.report");
+        assert!(report.summary.contains("3 responsive hosts, 4 open"));
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| { item.label == "survey_event_id" && item.value == completed.id })
+        );
+        assert!(
+            report.evidence.iter().any(|item| {
+                item.label == "endpoints_first_32" && item.value == "192.168.1.2:80"
+            })
+        );
+        let stale = lan_report(&[completed], Some("later-survey-id")).unwrap_err();
+        assert!(stale.to_string().contains("no longer retained"));
+    }
+
+    #[tokio::test]
+    async fn lan_toggle_controls_survey_without_network_traffic() {
+        let path = std::env::temp_dir().join(format!(
+            "spectre-lan-toggle-test-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        Config::default().save(&path).unwrap();
+        let hub = EventHub::new(100);
+        let off = execute_line("lan off", &hub, &path).await.unwrap();
+        assert_eq!(off[0].kind, "config.lan_assessment");
+        assert!(!Config::load(&path).unwrap().lan_assessment_enabled);
+        let disabled = execute_line("lan survey", &hub, &path).await.unwrap_err();
+        assert!(disabled.to_string().contains("off"));
+        assert!(hub.snapshot().iter().all(|event| event.module != "lan"));
+        execute_line("lan on", &hub, &path).await.unwrap();
+        assert!(Config::load(&path).unwrap().lan_assessment_enabled);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]

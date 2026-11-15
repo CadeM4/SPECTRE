@@ -18,6 +18,9 @@ pub struct Config {
     pub refresh_ms: u64,
     pub retention_events: usize,
     pub autonomous: bool,
+    /// Makes the discovered local IPv4 survey available as an explicit session.
+    /// It does not start network traffic when SPECTRE launches.
+    pub lan_assessment_enabled: bool,
     pub allowed_targets: Vec<String>,
     pub enabled_modules: Vec<String>,
     pub prepared_workflow: Vec<String>,
@@ -32,11 +35,13 @@ impl Default for Config {
             refresh_ms: 500,
             retention_events: 2_000,
             autonomous: true,
+            lan_assessment_enabled: true,
             allowed_targets: Vec::new(),
             enabled_modules: vec![
                 "host".into(),
                 "process".into(),
                 "binary".into(),
+                "traffic".into(),
                 "correlation".into(),
             ],
             prepared_workflow: Vec::new(),
@@ -64,8 +69,9 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("cannot read configuration {}", path.display()))?;
-        let config: Self = toml::from_str(&content)
+        let mut config: Self = toml::from_str(&content)
             .with_context(|| format!("invalid configuration {}", path.display()))?;
+        config.upgrade_default_modules();
         config.validate()?;
         Ok(config)
     }
@@ -142,7 +148,7 @@ impl Config {
             normalize_target(target)?;
         }
         for module in &self.enabled_modules {
-            if !["host", "process", "binary", "correlation"].contains(&module.as_str()) {
+            if !["host", "process", "binary", "traffic", "correlation"].contains(&module.as_str()) {
                 bail!("unknown autonomous module: {module}");
             }
         }
@@ -185,6 +191,7 @@ impl Config {
                     "host".into(),
                     "process".into(),
                     "binary".into(),
+                    "traffic".into(),
                     "correlation".into(),
                 ];
             }
@@ -194,6 +201,7 @@ impl Config {
                     "host".into(),
                     "process".into(),
                     "binary".into(),
+                    "traffic".into(),
                     "correlation".into(),
                 ];
             }
@@ -210,6 +218,23 @@ impl Config {
         }
         self.profile = profile.into();
         self.validate()
+    }
+
+    /// Existing installations with an untouched bundled profile get the new
+    /// passive traffic module. Custom selections remain exactly as saved.
+    fn upgrade_default_modules(&mut self) {
+        if !matches!(self.profile.as_str(), "local-research" | "binary-monitor") {
+            return;
+        }
+        let mut modules = self
+            .enabled_modules
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        modules.sort_unstable();
+        if modules == ["binary", "correlation", "host", "process"] {
+            self.enabled_modules.push("traffic".into());
+        }
     }
 }
 
@@ -291,6 +316,44 @@ mod tests {
         assert_eq!(loaded.theme, "amber");
         assert!(loaded.enabled_modules.contains(&"binary".into()));
         assert!(loaded.target_allowed("example.com"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn existing_configuration_defaults_lan_session_to_available() {
+        let mut value = toml::Value::try_from(Config::default()).unwrap();
+        value
+            .as_table_mut()
+            .unwrap()
+            .remove("lan_assessment_enabled");
+        let config: Config = value.try_into().unwrap();
+        assert!(config.lan_assessment_enabled);
+        assert!(config.allowed_targets.is_empty());
+    }
+
+    #[test]
+    fn unchanged_bundled_profile_gains_passive_traffic_on_load() {
+        let path = std::env::temp_dir().join(format!(
+            "spectre-traffic-upgrade-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut config = Config {
+            profile: "binary-monitor".into(),
+            ..Config::default()
+        };
+        config.enabled_modules.retain(|module| module != "traffic");
+        config.save(&path).unwrap();
+        let migrated = Config::load(&path).unwrap();
+        assert!(migrated.enabled_modules.contains(&"traffic".into()));
+
+        config.profile = "custom".into();
+        config.save(&path).unwrap();
+        let custom = Config::load(&path).unwrap();
+        assert!(!custom.enabled_modules.contains(&"traffic".into()));
         std::fs::remove_file(path).unwrap();
     }
 

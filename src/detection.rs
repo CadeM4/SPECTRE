@@ -194,7 +194,7 @@ fn observation_fields(event: &Event) -> Vec<(IndicatorKind, String, &'static str
                 push_canonical(&mut fields, kind, subject, "subject");
             }
         }
-        ("network", "tcp_open") => {
+        ("network", "tcp_open") | ("lan", "lan.host" | "lan.tcp_open") => {
             for evidence in event
                 .evidence
                 .iter()
@@ -383,6 +383,43 @@ mod tests {
         .with_evidence("src_ip", "192.0.2.7", "capture")
         .with_evidence("dst_ip", "198.51.100.4", "capture");
         assert_eq!(evaluate(&flow, &[ip]).len(), 1);
+    }
+
+    #[test]
+    fn lan_ip_matches_preserve_the_observed_event_link() {
+        let indicator = Indicator::parse("ip", "192.168.1.42", "local watch").unwrap();
+        for kind in ["lan.host", "lan.tcp_open"] {
+            let mut observed = source("lan", kind, Some("192.168.1.42")).with_evidence(
+                "address",
+                "192.168.1.42",
+                "tcp_connect",
+            );
+            observed.source = SourceKind::Live;
+            let matches = evaluate(&observed, std::slice::from_ref(&indicator));
+            assert_eq!(matches.len(), 1, "{kind}");
+            let detection = &matches[0];
+            assert_eq!(detection.subject, observed.subject);
+            assert_eq!(detection.source, SourceKind::Derived);
+            assert!(
+                detection
+                    .evidence
+                    .iter()
+                    .any(|item| { item.label == "source_event_id" && item.value == observed.id })
+            );
+            assert!(
+                detection.evidence.iter().any(|item| {
+                    item.label == "matched_field" && item.value == "evidence.address"
+                })
+            );
+            assert!(evaluate(detection, std::slice::from_ref(&indicator)).is_empty());
+        }
+
+        let summary = source("lan", "lan.survey_complete", Some("192.168.1.0/24")).with_evidence(
+            "address",
+            "192.168.1.42",
+            "unrelated_metadata",
+        );
+        assert!(evaluate(&summary, &[indicator]).is_empty());
     }
 
     #[test]

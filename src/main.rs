@@ -52,6 +52,21 @@ enum Action {
     },
     /// Inspect response security properties on a scoped URL
     Http { url: String },
+    /// Inspect live processes without changing them
+    Process {
+        #[command(subcommand)]
+        action: ProcessAction,
+    },
+    /// Read current network interface counters without capturing packets
+    Traffic {
+        #[command(subcommand)]
+        action: TrafficAction,
+    },
+    /// Inspect or survey the active private IPv4 network
+    Lan {
+        #[command(subcommand)]
+        action: LanAction,
+    },
     /// Manage exact-match authorized targets
     Scope {
         #[command(subcommand)]
@@ -89,6 +104,35 @@ enum ScopeAction {
     Add { target: String },
     Remove { target: String },
     List,
+}
+
+#[derive(Subcommand)]
+enum LanAction {
+    /// Show the active interface and exact survey segment without sending packets
+    Status,
+    /// Enable local-network assisted assessment
+    On,
+    /// Disable local-network assisted assessment
+    Off,
+    /// Probe the active private IPv4 segment for TCP responses and open services
+    Survey,
+}
+
+#[derive(Subcommand)]
+enum ProcessAction {
+    /// Show processes using the most resident memory
+    Top {
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Inspect a numeric PID or the current SPECTRE process
+    Inspect { pid: String },
+}
+
+#[derive(Subcommand)]
+enum TrafficAction {
+    /// Show current per-interface byte counters
+    Snapshot,
 }
 
 #[derive(Subcommand)]
@@ -236,6 +280,19 @@ async fn main() -> Result<()> {
                     ports.unwrap_or_else(|| "22,80,443,8080,8443".into())
                 ),
                 Action::Http { url } => format!("http {}", quote(&url)),
+                Action::Process { action } => match action {
+                    ProcessAction::Top { limit } => format!("process top {limit}"),
+                    ProcessAction::Inspect { pid } => format!("process inspect {}", quote(&pid)),
+                },
+                Action::Traffic {
+                    action: TrafficAction::Snapshot,
+                } => "traffic snapshot".into(),
+                Action::Lan { action } => match action {
+                    LanAction::Status => "lan status".into(),
+                    LanAction::On => "lan on".into(),
+                    LanAction::Off => "lan off".into(),
+                    LanAction::Survey => "lan survey".into(),
+                },
                 Action::Scope {
                     action: ScopeAction::Add { target },
                 } => format!("scope add {}", quote(&target)),

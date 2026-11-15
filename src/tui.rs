@@ -83,6 +83,7 @@ enum SettingChange {
     Profile(String),
     Refresh(u64),
     AutonomousToggle,
+    LanToggle,
 }
 
 impl Theme {
@@ -274,8 +275,8 @@ pub struct TuiState {
     pending_step: Option<(String, usize)>,
     pending_explicit_runs: HashSet<(String, usize)>,
     completed_explicit_runs: HashSet<(String, usize)>,
-    session_running: bool,
-    failed_session_stages: HashSet<usize>,
+    running_session: Option<String>,
+    failed_session_stages: HashSet<(String, usize)>,
     subject_counts: BTreeMap<String, usize>,
     detail_scroll: u16,
     view: View,
@@ -322,7 +323,7 @@ impl TuiState {
             pending_step: None,
             pending_explicit_runs: HashSet::new(),
             completed_explicit_runs: HashSet::new(),
-            session_running: false,
+            running_session: None,
             failed_session_stages: HashSet::new(),
             subject_counts: BTreeMap::new(),
             detail_scroll: 0,
@@ -411,13 +412,13 @@ impl TuiState {
                 if self.prepared.next_step() {
                     let (index, count) = self.prepared.position();
                     self.status = if skipped_explicit_action {
-                        format!("Scoped action skipped; stage {index}/{count}")
+                        format!("Network step skipped; stage {index}/{count}")
                     } else {
                         format!("Stage {index}/{count} ready")
                     };
                 } else {
                     self.status = if skipped_explicit_action {
-                        "Scenario complete; scoped action was skipped".to_string()
+                        "Scenario complete; network step was skipped".to_string()
                     } else {
                         "Scenario complete".to_string()
                     };
@@ -435,16 +436,17 @@ impl TuiState {
                 }
                 if self.current_stage_key().as_ref() == Some(&key) {
                     self.status = if event.kind == "assisted.run.complete" {
-                        "Scoped run complete; Enter continues".to_string()
+                        "Network step complete; Enter continues".to_string()
                     } else {
-                        "Scoped run failed; Ctrl+R retries".to_string()
+                        "Network step failed; Ctrl+R retries".to_string()
                     };
                 }
             }
             "assisted.session.stage" => {
-                if !self.session_running
-                    || event_evidence(event, "scenario") != Some("local-research")
-                {
+                let Some(scenario_id) = event_evidence(event, "scenario") else {
+                    return;
+                };
+                if self.running_session.as_deref() != Some(scenario_id) {
                     return;
                 }
                 let Some(index) = event_evidence(event, "step_index")
@@ -455,11 +457,12 @@ impl TuiState {
                 let phase = event_evidence(event, "phase").unwrap_or("stage");
                 let failed = event_evidence(event, "status") == Some("error");
                 if failed {
-                    self.failed_session_stages.insert(index);
+                    self.failed_session_stages
+                        .insert((scenario_id.to_owned(), index));
                 }
                 if self
                     .scenario()
-                    .is_some_and(|scenario| scenario.id == "local-research")
+                    .is_some_and(|scenario| scenario.id == scenario_id)
                     && index > 0
                     && index <= self.prepared.steps.len()
                 {
@@ -474,34 +477,49 @@ impl TuiState {
                 let count = self
                     .scenarios
                     .iter()
-                    .find(|scenario| scenario.id == "local-research")
+                    .find(|scenario| scenario.id == scenario_id)
                     .map(|scenario| scenario.steps.len())
                     .unwrap_or(0);
                 self.status = format!(
-                    "Local session {index}/{count}: {phase} {}",
+                    "{} session {index}/{count}: {phase} {}",
+                    session_label(scenario_id),
                     if failed { "failed" } else { "complete" }
                 );
             }
             "assisted.session.complete" | "assisted.session.error" => {
-                if event_evidence(event, "scenario") != Some("local-research") {
+                let Some(scenario_id) = event_evidence(event, "scenario") else {
+                    return;
+                };
+                if self.running_session.as_deref() != Some(scenario_id) {
                     return;
                 }
-                self.session_running = false;
+                self.running_session = None;
                 self.status = if event.kind == "assisted.session.complete" {
                     let succeeded = event_evidence(event, "succeeded").unwrap_or("?");
-                    let total = self
-                        .scenarios
-                        .iter()
-                        .find(|scenario| scenario.id == "local-research")
-                        .map(|scenario| scenario.steps.len())
+                    let total = event_evidence(event, "failed")
+                        .and_then(|failed| {
+                            Some(succeeded.parse::<usize>().ok()? + failed.parse::<usize>().ok()?)
+                        })
+                        .or_else(|| {
+                            self.scenarios
+                                .iter()
+                                .find(|scenario| scenario.id == scenario_id)
+                                .map(|scenario| scenario.steps.len())
+                        })
                         .unwrap_or(0);
                     if succeeded.parse::<usize>().ok() == Some(total) {
-                        format!("Local {succeeded}/{total} stages complete")
+                        format!(
+                            "{} {succeeded}/{total} stages complete",
+                            session_label(scenario_id)
+                        )
                     } else {
-                        format!("Local {succeeded}/{total} stages passed")
+                        format!(
+                            "{} {succeeded}/{total} stages passed",
+                            session_label(scenario_id)
+                        )
                     }
                 } else {
-                    "Local run stopped; F6 retries".to_string()
+                    format!("{} run stopped; F6 retries", session_label(scenario_id))
                 };
             }
             _ => {}
@@ -560,6 +578,10 @@ impl TuiState {
         if self.scenarios.is_empty() {
             return;
         }
+        if let Some(id) = self.scenario().map(|scenario| scenario.id.clone()) {
+            self.completed_explicit_runs
+                .retain(|(scenario_id, _)| scenario_id != &id);
+        }
         let count = self.scenarios.len();
         self.scenario_index = if reverse {
             (self.scenario_index + count - 1) % count
@@ -580,6 +602,9 @@ impl TuiState {
     fn previous_assisted_stage(&mut self) {
         if self.prepared.index > 0 {
             self.prepared.index -= 1;
+        }
+        if let Some(key) = self.current_stage_key() {
+            self.completed_explicit_runs.remove(&key);
         }
         self.prepared.reset_step();
         let (index, count) = self.prepared.position();
@@ -624,6 +649,18 @@ impl TuiState {
         self.apply_setting(SettingChange::Profile(profile.to_string()), command_tx);
     }
 
+    fn toggle_lan_assessment(&mut self, command_tx: &mpsc::Sender<WorkspaceRequest>) {
+        if self.running_session.is_some()
+            || self.pending_step.is_some()
+            || !self.pending_explicit_runs.is_empty()
+        {
+            self.status = "Wait for the current assisted work to finish".to_string();
+            return;
+        }
+        self.apply_setting(SettingChange::LanToggle, command_tx);
+        self.sync_config_from_disk();
+    }
+
     fn apply_setting(
         &mut self,
         change: SettingChange,
@@ -640,6 +677,9 @@ impl TuiState {
                 SettingChange::Profile(profile) => next.apply_profile(profile)?,
                 SettingChange::Refresh(refresh_ms) => next.refresh_ms = *refresh_ms,
                 SettingChange::AutonomousToggle => next.autonomous = !next.autonomous,
+                SettingChange::LanToggle => {
+                    next.lan_assessment_enabled = !next.lan_assessment_enabled
+                }
             }
             next.save(&self.config_path)?;
             Ok(next)
@@ -655,6 +695,14 @@ impl TuiState {
                     SettingChange::AutonomousToggle => format!(
                         "Autonomous collection: {}",
                         if config.autonomous { "on" } else { "off" }
+                    ),
+                    SettingChange::LanToggle => format!(
+                        "LAN survey: {}",
+                        if config.lan_assessment_enabled {
+                            "on"
+                        } else {
+                            "off"
+                        }
                     ),
                 };
                 self.theme = Theme::from_name(&config.theme);
@@ -812,6 +860,7 @@ fn handle_key(
             KeyCode::Char('t') => state.cycle_theme(command_tx),
             KeyCode::Char('l') => state.view = state.view.next(),
             KeyCode::Char('p') => state.cycle_profile(command_tx),
+            KeyCode::Char('n') => state.toggle_lan_assessment(command_tx),
             KeyCode::Char('r') => {
                 let refresh_ms = match state.refresh_ms {
                     0..=100 => 250,
@@ -839,7 +888,7 @@ fn handle_key(
             return false;
         }
         KeyCode::F(6) if state.mode == InteractionMode::Assisted => {
-            run_local_assisted_session(state, command_tx);
+            run_assisted_session(state, command_tx);
             return false;
         }
         KeyCode::PageUp => {
@@ -867,7 +916,9 @@ fn handle_key(
         return false;
     }
     if state.mode == InteractionMode::Assisted
-        && (state.session_running || state.pending_step.is_some())
+        && (state.running_session.is_some()
+            || state.pending_step.is_some()
+            || !state.pending_explicit_runs.is_empty())
         && matches!(
             key.code,
             KeyCode::Tab
@@ -879,8 +930,10 @@ fn handle_key(
                 | KeyCode::Esc
         )
     {
-        state.status = if state.session_running {
-            "Local session running; wait for the result".to_string()
+        state.status = if state.running_session.is_some() {
+            "Session running; wait for the result".to_string()
+        } else if !state.pending_explicit_runs.is_empty() {
+            "Network step running; wait for the result".to_string()
         } else {
             "Stage running; wait for the result".to_string()
         };
@@ -974,7 +1027,13 @@ fn handle_key(
                     }
                 }
             }
-            KeyCode::Esc => state.prepared.reset_step(),
+            KeyCode::Esc => {
+                if let Some(key) = state.current_stage_key() {
+                    state.completed_explicit_runs.remove(&key);
+                }
+                state.prepared.reset_step();
+                state.status = "Stage reset; reveal it again".to_string();
+            }
             _ => {}
         },
     }
@@ -982,7 +1041,7 @@ fn handle_key(
 }
 
 fn run_assisted_explicit(state: &mut TuiState, command_tx: &mpsc::Sender<WorkspaceRequest>) {
-    if state.session_running || state.pending_step.is_some() {
+    if state.running_session.is_some() || state.pending_step.is_some() {
         state.status = "Wait for the current stage to finish".to_string();
         return;
     }
@@ -1010,11 +1069,11 @@ fn run_assisted_explicit(state: &mut TuiState, command_tx: &mpsc::Sender<Workspa
     let (index, _) = state.prepared.position();
     let key = (scenario_id.clone(), index);
     if state.pending_explicit_runs.contains(&key) {
-        state.status = "Scoped run is still pending".to_string();
+        state.status = "Network step is still pending".to_string();
         return;
     }
     if state.completed_explicit_runs.contains(&key) {
-        state.status = "Scoped run already completed for this stage".to_string();
+        state.status = "Network step already completed for this stage".to_string();
         return;
     }
     let text = step.input.clone();
@@ -1025,18 +1084,18 @@ fn run_assisted_explicit(state: &mut TuiState, command_tx: &mpsc::Sender<Workspa
     }) {
         Ok(()) => {
             state.pending_explicit_runs.insert(key);
-            state.status = "Scoped run requested; wait for the result".to_string();
+            state.status = "Network step requested; wait for the result".to_string();
         }
-        Err(error) => state.status = format!("Scoped run was not submitted: {error}"),
+        Err(error) => state.status = format!("Network step was not submitted: {error}"),
     }
 }
 
-fn run_local_assisted_session(state: &mut TuiState, command_tx: &mpsc::Sender<WorkspaceRequest>) {
-    if state.session_running {
-        state.status = "Local session is already running".to_string();
+fn run_assisted_session(state: &mut TuiState, command_tx: &mpsc::Sender<WorkspaceRequest>) {
+    if state.running_session.is_some() {
+        state.status = "A session is already running".to_string();
         return;
     }
-    if state.pending_step.is_some() {
+    if state.pending_step.is_some() || !state.pending_explicit_runs.is_empty() {
         state.status = "Wait for the current stage to finish".to_string();
         return;
     }
@@ -1044,24 +1103,45 @@ fn run_local_assisted_session(state: &mut TuiState, command_tx: &mpsc::Sender<Wo
         state.status = "No assisted scenario available".to_string();
         return;
     };
-    if scenario.id != "local-research" {
-        state.status = "F6 runs the built-in local research session only".to_string();
+    if !matches!(
+        scenario.id.as_str(),
+        "system-network" | "local-research" | "local-network" | "process-investigation"
+    ) && !scenario.id.starts_with("scoped-network:")
+    {
+        state.status =
+            "F6 runs built-in scenarios; custom text remains presentation-only".to_string();
         return;
     }
     let scenario_id = scenario.id.clone();
+    let label = session_label(&scenario_id);
     let inputs = scenario
         .steps
         .iter()
         .map(|step| step.input.clone())
         .collect();
-    match command_tx.try_send(WorkspaceRequest::AssistedRunLocalSession { scenario_id }) {
+    match command_tx.try_send(WorkspaceRequest::AssistedRunSession {
+        scenario_id: scenario_id.clone(),
+    }) {
         Ok(()) => {
             state.prepared = PreparedInput::new(inputs);
-            state.session_running = true;
-            state.failed_session_stages.clear();
-            state.status = "Local session running…".to_string();
+            state.running_session = Some(scenario_id.clone());
+            state
+                .failed_session_stages
+                .retain(|(id, _)| id != &scenario_id);
+            state.status = format!("{label} session running…");
         }
-        Err(error) => state.status = format!("Local session was not submitted: {error}"),
+        Err(error) => state.status = format!("{label} session was not submitted: {error}"),
+    }
+}
+
+fn session_label(scenario_id: &str) -> &'static str {
+    match scenario_id {
+        "system-network" => "Survey",
+        "local-research" => "Local",
+        "local-network" => "LAN",
+        "process-investigation" => "Process",
+        _ if scenario_id.starts_with("scoped-network:") => "Target",
+        _ => "Assisted",
     }
 }
 
@@ -1428,8 +1508,9 @@ fn render_assisted_input(frame: &mut Frame<'_>, area: Rect, state: &TuiState, pa
             .skip(start)
             .take(if scenario.steps.len() > 8 { 5 } else { 8 })
             .map(|(index, step)| {
-                let mark = if scenario.id == "local-research"
-                    && state.failed_session_stages.contains(&(index + 1))
+                let mark = if state
+                    .failed_session_stages
+                    .contains(&(scenario.id.clone(), index + 1))
                 {
                     "!"
                 } else if index < state.prepared.index
@@ -1448,26 +1529,29 @@ fn render_assisted_input(frame: &mut Frame<'_>, area: Rect, state: &TuiState, pa
         let stage_progress = truncate(&stage_progress, area.width.saturating_sub(4) as usize);
         let stage_key = (scenario.id.clone(), stage_index);
         let action = match step.execution {
-            Execution::Local if state.session_running => "LOCAL SESSION RUNNING",
+            _ if state.running_session.as_deref() == Some(&scenario.id) => "SESSION RUNNING",
             Execution::Local => "LOCAL: Enter or F6 full session",
             Execution::Explicit if state.pending_explicit_runs.contains(&stage_key) => {
-                "SCOPED RUN PENDING"
+                "NETWORK RUN PENDING"
             }
             Execution::Explicit if state.completed_explicit_runs.contains(&stage_key) => {
-                "SCOPED RUN COMPLETE"
+                "NETWORK RUN COMPLETE"
             }
-            Execution::Explicit => "SCOPED: Ctrl+R to run",
+            Execution::Explicit => "NETWORK: Ctrl+R step or F6 full session",
             Execution::PresentationOnly => "PRESENTATION: records only",
         };
         let instruction = match step.execution {
-            Execution::Local if state.session_running => {
+            _ if state.running_session.as_deref() == Some(&scenario.id) => {
                 "F6 session running  ·  Results and stage progress appear above"
             }
-            Execution::Local => {
+            Execution::Local if scenario.id == "local-research" => {
                 "F6 runs full local session  ·  Enter runs one revealed step  ·  Left goes back"
             }
+            Execution::Local => {
+                "F6 runs full scenario  ·  Enter runs one revealed step  ·  Left goes back"
+            }
             Execution::Explicit => {
-                "Ctrl+R runs revealed scoped action  ·  Enter records and continues  ·  Left goes back"
+                "F6 runs full scenario  ·  Ctrl+R runs revealed step  ·  Enter records only"
             }
             Execution::PresentationOnly => {
                 "Type to reveal  ·  Enter records text only  ·  Left goes back  ·  Tab selects"
@@ -1523,7 +1607,7 @@ fn render_assisted_input(frame: &mut Frame<'_>, area: Rect, state: &TuiState, pa
             area,
         );
     } else {
-        let title = if scenario.id == "local-research" {
+        let title = if scenario.id != "custom" {
             format!(
                 " ASSISTED  {stage_index}/{stage_count}  {}  F6 Run ",
                 step.phase
@@ -1569,7 +1653,7 @@ fn fit_tail(value: &str, max_width: usize) -> String {
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState, palette: Palette) {
     let shortcuts = if state.mode == InteractionMode::Assisted && area.width >= 112 {
-        "F6 Run all  F1 Help  F2 Mode  Tab Scenario  Left Prev  Ctrl+R Scoped"
+        "F6 Run all  F1 Help  F2 Mode  Tab Scenario  Left Prev  Ctrl+R Step"
     } else if state.mode == InteractionMode::Assisted && area.width >= 78 {
         "F6 Run  F2 Mode  Tab Next  Left Prev  Ctrl+R"
     } else if state.mode == InteractionMode::Assisted {
@@ -1598,7 +1682,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState, palette: P
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect, palette: Palette) {
-    let popup = centered(area, 74, 23);
+    let popup = centered(area, 74, 24);
     frame.render_widget(Clear, popup);
     let help = [
         "SPECTRE / KEYBOARD",
@@ -1609,16 +1693,16 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, palette: Palette) {
         "Ctrl+J / K     Select newer / older observation",
         "Ctrl+U / D     Scroll evidence up / down",
         "Page Down / Up Select newer / older observations by ten",
-        "",
         "AUTONOMOUS     / opens command input; Up/Down inspect events",
         "INTERACTIVE    Enter submits command; Up/Down recall history",
         "ASSISTED       Tab / Shift+Tab selects a guided scenario",
-        "               Left returns to the previous stage to retry",
+        "               Left revisits; Esc resets a stage to rerun",
         "               Each character reveals one prepared character",
         "               Enter runs local steps, records and advances",
-        "               F6 runs the full built-in local session",
-        "               Ctrl+R explicitly runs a revealed scoped step",
+        "               F6 runs the full selected built-in session",
+        "               Ctrl+R runs a revealed network step",
         "               Custom steps are recorded, never executed",
+        "               F5 then n toggles the LAN survey scenario",
         "",
         "Esc closes this panel. Ctrl+C exits.",
     ];
@@ -1631,15 +1715,20 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, palette: Palette) {
 }
 
 fn render_settings(frame: &mut Frame<'_>, area: Rect, state: &TuiState, palette: Palette) {
-    let popup = centered(area, 64, 16);
+    let popup = centered(area, 64, 18);
     frame.render_widget(Clear, popup);
     let content = format!(
-        "WORKSPACE SETTINGS\n\n  p  Profile            {}\n  t  Theme              {}\n  l  Arrangement        {}\n  r  Display refresh    {} ms\n  a  Autonomous work    {}\n\nProfile, theme, refresh and autonomous work are saved.\nArrangement applies to this session.\nScope and modules: spectre configure\n\nEsc closes settings.",
+        "WORKSPACE SETTINGS\n\n  p  Profile            {}\n  t  Theme              {}\n  l  Arrangement        {}\n  r  Display refresh    {} ms\n  a  Autonomous work    {}\n  n  LAN survey         {}\n\nSettings are saved; arrangement is session-only.\nAssisted LAN traffic starts with F6 or Ctrl+R.\nExact targets: spectre scope add/remove HOST\n\nEsc closes settings.",
         state.profile,
         state.theme.label(),
         state.view.label().to_ascii_lowercase(),
         state.refresh_ms,
-        if state.config.autonomous { "on" } else { "off" }
+        if state.config.autonomous { "on" } else { "off" },
+        if state.config.lan_assessment_enabled {
+            "on"
+        } else {
+            "off"
+        }
     );
     frame.render_widget(
         Paragraph::new(content)
@@ -1739,6 +1828,16 @@ mod tests {
         render_state_to_text(&state, width, height)
     }
 
+    fn select_scenario(state: &mut TuiState, id: &str) {
+        for _ in 0..state.scenarios.len() {
+            if state.scenario().is_some_and(|scenario| scenario.id == id) {
+                return;
+            }
+            state.cycle_scenario(false);
+        }
+        panic!("assisted scenario {id} not found");
+    }
+
     #[test]
     fn prepared_input_reveals_text_by_character_not_typed_key() {
         let mut input = PreparedInput::new(vec![
@@ -1801,16 +1900,17 @@ mod tests {
     }
 
     #[test]
-    fn assisted_starts_with_multistep_local_scenario() {
+    fn assisted_starts_with_full_system_and_network_scenario() {
         let state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
-        assert_eq!(state.scenario().unwrap().id, "local-research");
-        assert!(state.prepared.steps.len() > 1);
-        assert_eq!(state.prepared.current(), Some("doctor"));
+        assert_eq!(state.scenario().unwrap().id, "system-network");
+        assert!(state.prepared.steps.len() >= 8);
+        assert!(state.prepared.current().is_some());
     }
 
     #[test]
     fn tab_cycles_scenarios_and_resets_prepared_input() {
         let config = Config {
+            lan_assessment_enabled: false,
             allowed_targets: vec!["example.org".into()],
             prepared_workflow: vec!["saved text".into()],
             ..Config::default()
@@ -1823,7 +1923,21 @@ mod tests {
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
             &tx,
         );
-        assert_eq!(state.prepared.visible(), "d");
+        assert_eq!(state.prepared.visible().chars().count(), 1);
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(state.scenario().unwrap().id, "local-research");
+        assert_eq!(state.prepared.visible(), "");
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(state.scenario().unwrap().id, "process-investigation");
+        assert_eq!(state.prepared.visible(), "");
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
@@ -1856,12 +1970,13 @@ mod tests {
             std::process::id()
         ));
         let mut config = Config {
+            lan_assessment_enabled: false,
             prepared_workflow: vec!["first step".into()],
             ..Config::default()
         };
         config.save(&path).unwrap();
         let mut state = TuiState::new(config.clone(), path.clone());
-        state.cycle_scenario(false);
+        select_scenario(&mut state, "custom");
         assert_eq!(state.scenario().unwrap().id, "custom");
         config.prepared_workflow.push("second step".into());
         config.save(&path).unwrap();
@@ -1875,6 +1990,7 @@ mod tests {
     fn assisted_enter_submits_only_after_reveal() {
         let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
         state.mode = InteractionMode::Assisted;
+        select_scenario(&mut state, "local-research");
         let (tx, mut rx) = mpsc::channel(4);
         handle_key(
             &mut state,
@@ -1903,7 +2019,7 @@ mod tests {
                 text: "doctor".to_string(),
             }
         );
-        assert_eq!(state.prepared.position(), (1, 6));
+        assert_eq!(state.prepared.position(), (1, 7));
         assert_eq!(state.pending_step, Some(("local-research".to_string(), 1)));
         handle_key(
             &mut state,
@@ -1916,7 +2032,7 @@ mod tests {
             "local-research",
             1,
         ));
-        assert_eq!(state.prepared.position(), (2, 6));
+        assert_eq!(state.prepared.position(), (2, 7));
         assert!(state.pending_step.is_none());
     }
 
@@ -1924,6 +2040,7 @@ mod tests {
     fn failed_manual_stage_stays_revealed_and_enter_retries() {
         let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
         state.mode = InteractionMode::Assisted;
+        select_scenario(&mut state, "local-research");
         let (tx, mut rx) = mpsc::channel(4);
         while !state.prepared.complete() {
             state.prepared.advance();
@@ -1938,7 +2055,7 @@ mod tests {
             WorkspaceRequest::AssistedStep { index: 1, .. }
         ));
         state.ingest(assisted_event("assisted.step.error", "local-research", 1));
-        assert_eq!(state.prepared.position(), (1, 6));
+        assert_eq!(state.prepared.position(), (1, 7));
         assert!(state.prepared.complete());
         assert!(state.pending_step.is_none());
         handle_key(
@@ -1955,13 +2072,14 @@ mod tests {
             "local-research",
             1,
         ));
-        assert_eq!(state.prepared.position(), (2, 6));
+        assert_eq!(state.prepared.position(), (2, 7));
     }
 
     #[test]
     fn f6_runs_local_session_once_and_updates_stage_progress() {
         let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
         state.mode = InteractionMode::Assisted;
+        select_scenario(&mut state, "local-research");
         let (tx, mut rx) = mpsc::channel(4);
         handle_key(
             &mut state,
@@ -1970,11 +2088,11 @@ mod tests {
         );
         assert_eq!(
             rx.try_recv().unwrap(),
-            WorkspaceRequest::AssistedRunLocalSession {
+            WorkspaceRequest::AssistedRunSession {
                 scenario_id: "local-research".to_string(),
             }
         );
-        assert!(state.session_running);
+        assert_eq!(state.running_session.as_deref(), Some("local-research"));
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
@@ -1988,18 +2106,18 @@ mod tests {
                 "test",
             ),
         );
-        assert_eq!(state.prepared.position(), (1, 6));
+        assert_eq!(state.prepared.position(), (1, 7));
         assert_eq!(state.prepared.visible(), "doctor");
         state.ingest(
             assisted_event("assisted.session.stage", "local-research", 2)
                 .with_evidence("phase", "Collection", "test")
                 .with_evidence("status", "error", "test"),
         );
-        assert_eq!(state.prepared.position(), (2, 6));
-        assert!(state.status.contains("2/6"));
+        assert_eq!(state.prepared.position(), (2, 7));
+        assert!(state.status.contains("2/7"));
         assert!(state.status.contains("failed"));
         let screen = render_state_to_text(&state, 120, 30);
-        assert!(screen.contains("STAGE 2/6"), "{screen}");
+        assert!(screen.contains("STAGE 2/7"), "{screen}");
         assert!(screen.contains("!2 Collection"), "{screen}");
         state.ingest(
             Event::new(
@@ -2011,16 +2129,267 @@ mod tests {
                 SourceKind::Derived,
             )
             .with_evidence("scenario", "local-research", "test")
+            .with_evidence("succeeded", "6", "test"),
+        );
+        assert!(state.running_session.is_none());
+        assert_eq!(state.status, "Local 6/7 stages passed");
+    }
+
+    #[test]
+    fn f6_runs_default_system_network_scenario_with_one_request() {
+        let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        assert_eq!(state.scenario().unwrap().id, "system-network");
+        let (tx, mut rx) = mpsc::channel(4);
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            WorkspaceRequest::AssistedRunSession {
+                scenario_id: "system-network".into(),
+            }
+        );
+        assert_eq!(state.running_session.as_deref(), Some("system-network"));
+        assert!(state.status.contains("Survey session running"));
+    }
+
+    #[test]
+    fn f6_runs_entire_scoped_network_scenario_with_one_request() {
+        let config = Config {
+            lan_assessment_enabled: false,
+            allowed_targets: vec!["example.org".into()],
+            ..Config::default()
+        };
+        let mut state = TuiState::new(config, PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        select_scenario(&mut state, "scoped-network:example.org");
+        assert_eq!(state.scenario().unwrap().id, "scoped-network:example.org");
+        let (tx, mut rx) = mpsc::channel(4);
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            WorkspaceRequest::AssistedRunSession {
+                scenario_id: "scoped-network:example.org".to_string(),
+            }
+        );
+        assert_eq!(
+            state.running_session.as_deref(),
+            Some("scoped-network:example.org")
+        );
+        state.ingest(
+            assisted_event("assisted.session.stage", "scoped-network:example.org", 2)
+                .with_evidence("phase", "Port check", "test")
+                .with_evidence("status", "complete", "test"),
+        );
+        assert!(state.status.contains("Target session 2/5"));
+        state.ingest(
+            Event::new(
+                "presentation",
+                "assisted.session.complete",
+                "Target session complete",
+                None,
+                Severity::Info,
+                SourceKind::Derived,
+            )
+            .with_evidence("scenario", "scoped-network:example.org", "test")
             .with_evidence("succeeded", "5", "test"),
         );
-        assert!(!state.session_running);
-        assert_eq!(state.status, "Local 5/6 stages passed");
+        assert!(state.running_session.is_none());
+        assert_eq!(state.status, "Target 5/5 stages complete");
+    }
+
+    #[test]
+    fn f6_runs_entire_local_network_scenario_with_one_request() {
+        let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        select_scenario(&mut state, "local-network");
+        assert_eq!(state.scenario().unwrap().id, "local-network");
+        let (tx, mut rx) = mpsc::channel(4);
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            WorkspaceRequest::AssistedRunSession {
+                scenario_id: "local-network".to_string(),
+            }
+        );
+        assert_eq!(state.running_session.as_deref(), Some("local-network"));
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE),
+            &tx,
+        );
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(state.config.lan_assessment_enabled);
+        assert!(state.status.contains("Wait for the current assisted work"));
+    }
+
+    #[test]
+    fn f6_runs_process_investigation_and_tracks_progress() {
+        let config = Config {
+            lan_assessment_enabled: false,
+            ..Config::default()
+        };
+        let mut state = TuiState::new(config, PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        select_scenario(&mut state, "process-investigation");
+        assert_eq!(state.scenario().unwrap().id, "process-investigation");
+        let (tx, mut rx) = mpsc::channel(4);
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            WorkspaceRequest::AssistedRunSession {
+                scenario_id: "process-investigation".to_string(),
+            }
+        );
+        state.ingest(
+            assisted_event("assisted.session.stage", "process-investigation", 1)
+                .with_evidence("phase", "Process inventory", "test")
+                .with_evidence("status", "complete", "test"),
+        );
+        assert!(state.status.contains("Process session 1/3"));
+        state.ingest(
+            Event::new(
+                "presentation",
+                "assisted.session.complete",
+                "Process investigation complete",
+                None,
+                Severity::Info,
+                SourceKind::Derived,
+            )
+            .with_evidence("scenario", "process-investigation", "test")
+            .with_evidence("succeeded", "3", "test")
+            .with_evidence("failed", "0", "test"),
+        );
+        assert!(state.running_session.is_none());
+        assert_eq!(state.status, "Process 3/3 stages complete");
+    }
+
+    #[test]
+    fn settings_n_rapid_toggle_uses_current_saved_state() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "spectre-tui-lan-toggle-{}-{id}.toml",
+            std::process::id()
+        ));
+        let config = Config::default();
+        config.save(&path).unwrap();
+        let mut state = TuiState::new(config, path.clone());
+        let (tx, mut rx) = mpsc::channel(4);
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE),
+            &tx,
+        );
+        assert!(state.show_settings);
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            WorkspaceRequest::Command("config reload".into())
+        );
+        assert!(!state.config.lan_assessment_enabled);
+        assert!(!Config::load(&path).unwrap().lan_assessment_enabled);
+        assert!(state.status.contains("LAN survey: off"));
+        assert!(
+            state
+                .scenarios
+                .iter()
+                .all(|scenario| scenario.id != "local-network")
+        );
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            WorkspaceRequest::Command("config reload".into())
+        );
+        assert!(state.config.lan_assessment_enabled);
+        assert!(Config::load(&path).unwrap().lan_assessment_enabled);
+        assert!(state.status.contains("LAN survey: on"));
+        assert!(
+            state
+                .scenarios
+                .iter()
+                .any(|scenario| scenario.id == "local-network")
+        );
+        let screen = render_state_to_text(&state, 80, 24);
+        assert!(screen.contains("LAN survey"));
+        assert!(screen.contains("Esc closes settings."));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn help_keeps_lan_control_and_exit_visible_at_standard_height() {
+        let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
+        state.show_help = true;
+        let screen = render_state_to_text(&state, 80, 24);
+        assert!(
+            screen.contains("F5 then n toggles the LAN survey"),
+            "{screen}"
+        );
+        assert!(screen.contains("Esc closes this panel."), "{screen}");
+    }
+
+    #[test]
+    fn f6_does_not_execute_custom_prepared_text() {
+        let config = Config {
+            lan_assessment_enabled: false,
+            prepared_workflow: vec!["scan example.org 443".into()],
+            ..Config::default()
+        };
+        let mut state = TuiState::new(config, PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        select_scenario(&mut state, "custom");
+        assert_eq!(state.scenario().unwrap().id, "custom");
+        let (tx, mut rx) = mpsc::channel(4);
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(state.running_session.is_none());
+        assert!(state.status.contains("presentation-only"));
     }
 
     #[test]
     fn left_returns_to_previous_stage_with_hidden_input() {
         let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
         state.mode = InteractionMode::Assisted;
+        select_scenario(&mut state, "local-research");
         let (tx, mut rx) = mpsc::channel(4);
         while !state.prepared.complete() {
             state.prepared.advance();
@@ -2036,13 +2405,13 @@ mod tests {
             "local-research",
             1,
         ));
-        assert_eq!(state.prepared.position(), (2, 6));
+        assert_eq!(state.prepared.position(), (2, 7));
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
             &tx,
         );
-        assert_eq!(state.prepared.position(), (1, 6));
+        assert_eq!(state.prepared.position(), (1, 7));
         assert_eq!(state.prepared.visible(), "");
         assert!(!state.prepared.is_presented());
     }
@@ -2050,13 +2419,14 @@ mod tests {
     #[test]
     fn explicit_assisted_stage_requires_ctrl_r_and_only_queues_once() {
         let config = Config {
+            lan_assessment_enabled: false,
             allowed_targets: vec!["example.org".into()],
             ..Config::default()
         };
         let mut state = TuiState::new(config, PathBuf::from("unused.toml"));
         state.mode = InteractionMode::Assisted;
         let (tx, mut rx) = mpsc::channel(4);
-        state.cycle_scenario(false);
+        select_scenario(&mut state, "scoped-network:example.org");
         assert_eq!(state.scenario().unwrap().id, "scoped-network:example.org");
         for _ in 0.."scope list".len() {
             state.prepared.advance();
@@ -2107,6 +2477,14 @@ mod tests {
             &tx,
         );
         assert!(rx.try_recv().is_err());
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.prepared.position().0, 2);
+        assert!(state.status.contains("Network step running"));
         state.ingest(assisted_event(
             "assisted.run.error",
             "scoped-network:example.org",
@@ -2132,17 +2510,74 @@ mod tests {
             &tx,
         );
         assert!(rx.try_recv().is_err());
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(state.prepared.visible(), "");
+        while !state.prepared.complete() {
+            state.prepared.advance();
+        }
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            WorkspaceRequest::AssistedRun { index: 2, .. }
+        ));
+        state.ingest(assisted_event(
+            "assisted.run.complete",
+            "scoped-network:example.org",
+            2,
+        ));
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            WorkspaceRequest::AssistedStep { index: 2, .. }
+        ));
+        state.ingest(assisted_event(
+            "assisted.step.complete",
+            "scoped-network:example.org",
+            2,
+        ));
+        assert_eq!(state.prepared.position().0, 3);
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(state.prepared.position().0, 2);
+        while !state.prepared.complete() {
+            state.prepared.advance();
+        }
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            WorkspaceRequest::AssistedRun { index: 2, .. }
+        ));
     }
 
     #[test]
     fn explicit_stage_enter_does_not_request_network_run() {
         let config = Config {
+            lan_assessment_enabled: false,
             allowed_targets: vec!["example.org".into()],
             ..Config::default()
         };
         let mut state = TuiState::new(config, PathBuf::from("unused.toml"));
         state.mode = InteractionMode::Assisted;
-        state.cycle_scenario(false);
+        select_scenario(&mut state, "scoped-network:example.org");
         let (tx, mut rx) = mpsc::channel(4);
         while !state.prepared.complete() {
             state.prepared.advance();
@@ -2183,23 +2618,30 @@ mod tests {
             "scoped-network:example.org",
             2,
         ));
-        assert!(state.status.contains("Scoped action skipped"));
+        assert!(state.status.contains("Network step skipped"));
     }
 
     #[test]
     fn assisted_panel_shows_scenario_and_stage_at_wide_and_compact_sizes() {
-        let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
+        let mut state = TuiState::new(
+            Config {
+                lan_assessment_enabled: false,
+                ..Config::default()
+            },
+            PathBuf::from("unused.toml"),
+        );
         state.mode = InteractionMode::Assisted;
+        select_scenario(&mut state, "local-research");
         let wide = render_state_to_text(&state, 120, 30);
-        assert!(wide.contains("SCENARIO 1/1"), "{wide}");
-        assert!(wide.contains("STAGE 1/6"), "{wide}");
+        assert!(wide.contains("SCENARIO 2/3"), "{wide}");
+        assert!(wide.contains("STAGE 1/7"), "{wide}");
         assert!(wide.contains("Environment"), "{wide}");
         assert!(wide.contains("Check the platform"), "{wide}");
         assert!(wide.contains("F6 runs full local session"), "{wide}");
 
         let compact = render_state_to_text(&state, 48, 10);
         assert!(compact.contains("ASSISTED"), "{compact}");
-        assert!(compact.contains("1/6"), "{compact}");
+        assert!(compact.contains("1/7"), "{compact}");
         assert!(compact.contains("type any key"), "{compact}");
         assert!(compact.contains("F6"), "{compact}");
     }
@@ -2208,11 +2650,11 @@ mod tests {
     fn assisted_footer_keeps_controls_and_completion_visible() {
         let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
         state.mode = InteractionMode::Assisted;
-        state.status = "Local 6/6 stages complete".into();
+        state.status = "Local 7/7 stages complete".into();
         let screen = render_state_to_text(&state, 120, 30);
         let footer = screen.lines().last().unwrap();
-        assert!(footer.contains("Ctrl+R Scoped"), "{footer}");
-        assert!(footer.contains("6/6 stages complete"), "{footer}");
+        assert!(footer.contains("Ctrl+R Step"), "{footer}");
+        assert!(footer.contains("7/7 stages complete"), "{footer}");
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::{
 use crate::{
     analysis::binary::MAX_BINARY_BYTES,
     config::{Config, normalize_target},
+    network::lan,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,7 +41,11 @@ pub enum Execution {
 /// The scenarios describe actions; constructing them performs no analysis or I/O
 /// beyond resolving the current executable and checking candidate file sizes.
 pub fn scenarios(config: &Config) -> Vec<Scenario> {
-    let mut available = vec![local_research()];
+    let mut available = vec![system_network(config), local_research()];
+    if config.lan_assessment_enabled {
+        available.push(local_network());
+    }
+    available.push(process_investigation());
     let mut seen_targets = HashSet::new();
     for configured in &config.allowed_targets {
         if let Ok(target) = normalize_target(configured)
@@ -55,6 +60,123 @@ pub fn scenarios(config: &Config) -> Vec<Scenario> {
     }
 
     available
+}
+
+fn system_network(config: &Config) -> Scenario {
+    let local = local_research();
+    let process = process_investigation();
+    let mut steps = vec![
+        local.steps[0].clone(),
+        local.steps[1].clone(),
+        local.steps[2].clone(),
+        process.steps[0].clone(),
+        process.steps[1].clone(),
+        local.steps[4].clone(),
+        local.steps[5].clone(),
+    ];
+    let summary = if config.lan_assessment_enabled {
+        let network = local_network();
+        let network_summary = network.summary.clone();
+        steps[0].context = format!("Check platform capabilities. {network_summary}");
+        steps.extend(network.steps.into_iter().take(3));
+        format!("Run live host, process, binary and interface analysis. {network_summary}")
+    } else {
+        "Run a complete live host, process, binary and interface survey; LAN assessment is off."
+            .to_owned()
+    };
+    steps.push(step(
+        "Final triage",
+        "Review the actual observations from the complete session.",
+        "triage",
+        Execution::Local,
+    ));
+    Scenario {
+        id: "system-network".to_owned(),
+        title: "System and network".to_owned(),
+        summary,
+        steps,
+    }
+}
+
+fn local_network() -> Scenario {
+    let detected = lan::detect_lan().ok();
+    let (summary, survey_input, survey_context) = match detected {
+        Some(scope) => (
+            format!(
+                "Survey the real {} segment on {} ({}).",
+                scope.cidr, scope.interface, scope.local_ip
+            ),
+            format!("lan survey {}", quote_argument(&scope.cidr)),
+            format!(
+                "Probe the currently detected {} segment for TCP responses and open services.",
+                scope.cidr
+            ),
+        ),
+        None => (
+            "Detect the active private IPv4 segment, then survey it when available.".to_owned(),
+            "lan survey".to_owned(),
+            "Probe the current private IPv4 segment when one is available.".to_owned(),
+        ),
+    };
+    Scenario {
+        id: "local-network".to_owned(),
+        title: "Local network".to_owned(),
+        summary,
+        steps: vec![
+            step(
+                "Network context",
+                "Identify the active interface and exact IPv4 segment.",
+                "lan status",
+                Execution::Local,
+            ),
+            step(
+                "Host and service survey",
+                survey_context,
+                survey_input,
+                Execution::Explicit,
+            ),
+            step(
+                "Survey review",
+                "Summarize retained hosts and open endpoints from the latest survey.",
+                "lan report",
+                Execution::Local,
+            ),
+            step(
+                "Final triage",
+                "Review all retained local and network observations together.",
+                "triage",
+                Execution::Local,
+            ),
+        ],
+    }
+}
+
+fn process_investigation() -> Scenario {
+    Scenario {
+        id: "process-investigation".to_owned(),
+        title: "Process investigation".to_owned(),
+        summary: "Inspect the live process inventory and the current SPECTRE process.".to_owned(),
+        steps: vec![
+            step(
+                "Process inventory",
+                "Review the processes using the most resident memory now.",
+                "process top",
+                Execution::Local,
+            ),
+            step(
+                "Process detail",
+                "Inspect SPECTRE's live process identity, executable, parent, and memory.",
+                "process inspect self",
+                Execution::Local,
+            ),
+            step(
+                "Evidence review",
+                "Summarize the retained process and other observations.",
+                "triage",
+                Execution::Local,
+            ),
+        ],
+    }
 }
 
 fn local_research() -> Scenario {
@@ -89,6 +211,12 @@ fn local_research() -> Scenario {
                 "Collection",
                 "Review the modules collecting local observations.",
                 "module list",
+                Execution::Local,
+            ),
+            step(
+                "Interface traffic",
+                "Read the current real counters from active network interfaces.",
+                "traffic snapshot",
                 Execution::Local,
             ),
             step(
@@ -258,10 +386,10 @@ mod tests {
     #[test]
     fn local_research_is_ready_without_configuration() {
         let available = scenarios(&Config::default());
-        assert_eq!(available.len(), 1);
-        let local = &available[0];
+        assert_eq!(available.len(), 4);
+        let local = &available[1];
         assert_eq!(local.id, "local-research");
-        assert_eq!(local.steps.len(), 6);
+        assert_eq!(local.steps.len(), 7);
         assert!(
             local
                 .steps
@@ -269,22 +397,23 @@ mod tests {
                 .all(|step| step.execution == Execution::Local)
         );
         assert_eq!(local.steps[0].input, "doctor");
-        let binary = tokenize(&local.steps[3].input).unwrap();
+        assert_eq!(local.steps[2].input, "traffic snapshot");
+        let binary = tokenize(&local.steps[4].input).unwrap();
         assert_eq!(binary[0], "binary");
         let selected = PathBuf::from(&binary[1]);
         let current = std::env::current_exe().unwrap();
         if fits_binary_budget(&current) {
             assert_eq!(selected, current);
-            assert!(local.steps[3].context.contains("SPECTRE executable"));
+            assert!(local.steps[4].context.contains("SPECTRE executable"));
         } else if let Some(fallback) = platform_executable().filter(|path| fits_binary_budget(path))
         {
             assert_eq!(selected, fallback);
-            assert!(local.steps[3].context.contains("platform executable"));
+            assert!(local.steps[4].context.contains("platform executable"));
         } else {
             assert_eq!(selected, current);
         }
         assert!(
-            local.steps[3]
+            local.steps[4]
                 .context
                 .contains(&selected.to_string_lossy().to_string())
         );
@@ -328,13 +457,85 @@ mod tests {
             ..Config::default()
         };
         let available = scenarios(&config);
-        assert_eq!(available.len(), 2);
-        assert_eq!(available[1].id, "custom");
+        assert_eq!(available.len(), 5);
+        assert_eq!(available[4].id, "custom");
         assert!(
-            available[1]
+            available[4]
                 .steps
                 .iter()
                 .all(|step| step.execution == Execution::PresentationOnly)
+        );
+    }
+
+    #[test]
+    fn local_network_scenario_is_ready_and_can_be_disabled() {
+        let mut config = Config::default();
+        let available = scenarios(&config);
+        let network = available
+            .iter()
+            .find(|scenario| scenario.id == "local-network")
+            .unwrap();
+        assert_eq!(network.steps.len(), 4);
+        assert_eq!(network.steps[0].input, "lan status");
+        assert_eq!(network.steps[1].execution, Execution::Explicit);
+        assert!(network.steps[1].input.starts_with("lan survey"));
+        assert_eq!(network.steps[2].input, "lan report");
+        assert_eq!(network.steps[3].input, "triage");
+        config.lan_assessment_enabled = false;
+        assert!(
+            scenarios(&config)
+                .iter()
+                .all(|scenario| scenario.id != "local-network")
+        );
+    }
+
+    #[test]
+    fn first_scenario_runs_all_available_local_domains_in_one_session() {
+        let mut config = Config::default();
+        let available = scenarios(&config);
+        let survey = &available[0];
+        assert_eq!(survey.id, "system-network");
+        assert_eq!(survey.steps.len(), 11);
+        let inputs = survey
+            .steps
+            .iter()
+            .map(|step| step.input.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(inputs[0], "doctor");
+        assert!(inputs.contains(&"traffic snapshot"));
+        assert!(inputs.contains(&"process top"));
+        assert!(inputs.contains(&"process inspect self"));
+        assert!(inputs.iter().any(|input| input.starts_with("binary ")));
+        assert!(inputs.iter().any(|input| input.starts_with("lan survey")));
+        assert_eq!(inputs.last(), Some(&"triage"));
+
+        config.lan_assessment_enabled = false;
+        let disabled = scenarios(&config);
+        assert_eq!(disabled[0].steps.len(), 8);
+        assert!(
+            disabled[0]
+                .steps
+                .iter()
+                .all(|step| !step.input.starts_with("lan "))
+        );
+    }
+
+    #[test]
+    fn process_investigation_is_ready_without_configuration() {
+        let available = scenarios(&Config::default());
+        let process = available
+            .iter()
+            .find(|scenario| scenario.id == "process-investigation")
+            .unwrap();
+        assert_eq!(process.steps.len(), 3);
+        assert_eq!(process.steps[0].input, "process top");
+        assert_eq!(process.steps[1].input, "process inspect self");
+        assert_eq!(process.steps[2].input, "triage");
+        assert!(
+            process
+                .steps
+                .iter()
+                .all(|step| step.execution == Execution::Local)
         );
     }
 
@@ -400,7 +601,10 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "system-network",
                 "local-research",
+                "local-network",
+                "process-investigation",
                 "scoped-network:example.org",
                 "scoped-network:127.0.0.1",
                 "scoped-network:::1",
@@ -408,9 +612,9 @@ mod tests {
             ]
         );
         assert_eq!(
-            available[3].steps[1].input,
+            available[6].steps[1].input,
             "scan \"::1\" 22,80,443,8080,8443"
         );
-        assert_eq!(available[3].steps[3].input, "indicator list");
+        assert_eq!(available[6].steps[3].input, "indicator list");
     }
 }

@@ -10,10 +10,11 @@ SPECTRE brings local observations, offline artifact analysis, and explicitly sco
 
 | Area | Current capability |
 | --- | --- |
-| Local observation | Periodic host samples, process starts, process inventory, and bounded inspection of observed executables when the binary module is enabled. |
+| Local observation | Periodic host samples, process starts and inventory, per-interface traffic counters when enabled, and bounded inspection of observed executables when the binary module is enabled. |
+| Process investigation | A live top-process snapshot by resident memory and inspection of a selected PID, including memory, status, timing, and executable path when available. |
 | Binary analysis | PE, ELF, and Mach-O identity, SHA-256, sections and entropy, imports, linked libraries, exports, symbols, and bounded printable strings. |
 | Packet analysis | Offline classic PCAP parsing, flow counts, DNS questions, TLS ClientHello SNI, and HTTP Host observations. |
-| Network assessment | TCP connect checks against an exact configured target, with bounded concurrency and passive banner capture. A scoped investigation can follow observed web ports with HTTP inspection. |
+| Network assessment | A real TCP survey of the selected private IPv4 interface's directly connected segment, capped at /24, with HTTP follow-up on observed open web ports. Exact-target scans have bounded concurrency and passive banner capture. |
 | HTTP assessment | One scoped HTTP(S) response, including headers, cookie attributes, and HSTS observations. Redirects are not followed. |
 | Indicator matching | User-configured SHA-256, domain, and IP values matched against supported observation fields, with source event references. |
 | Investigation | A bounded event history, evidence inspection, subject links across modules, profile presets, and JSON Lines export. |
@@ -36,9 +37,13 @@ On macOS or Linux, if the shell reports `spectre: command not found` after insta
 
 `spectre` opens the terminal workspace when standard input and output are attached to a terminal. On first launch it chooses a local profile from detected memory, then writes the configuration. Systems with at least 8 GiB of RAM start with `binary-monitor`; other systems use `local-research`. Both profiles inspect real executables from the local process baseline, including SPECTRE itself when available. `local-research` uses a smaller queue and one analysis slot; `binary-monitor` covers more paths with two slots. Each profile then watches its bounded set of executable paths for metadata changes. Local observation starts automatically. It does not scan external targets in the background.
 
-The source build is the installation method at present. Precompiled packages and release installers have not been published. The project is tested locally on macOS; the CI workflow is intended to check Linux and Windows as well.
+The source build is the installation method at present. Precompiled packages and release installers have not been published. CI checks macOS, Linux, and Windows.
 
 Use `spectre profiles`, `spectre themes`, `spectre modules`, and `spectre indicators` to inspect the current configuration. `spectre version` displays the installed version and creator attribution.
+
+`spectre doctor` shows which local capabilities are available, including process inspection, interface counters, and the detected private LAN segment. It does not start a survey.
+
+`spectre traffic snapshot` reads real cumulative byte totals for nonloopback interfaces. When the `traffic` module is enabled, SPECTRE also samples byte and packet counter changes during local collection. These counters describe aggregate traffic for an interface; they do not contain packet contents, destinations, or per-process attribution.
 
 ## A short investigation
 
@@ -48,6 +53,16 @@ Offline inspection needs no target scope:
 spectre analyze binary /path/to/program
 spectre analyze pcap /path/to/capture.pcap
 ```
+
+For a current process snapshot, run:
+
+```sh
+spectre process top
+spectre process inspect self
+spectre process inspect 1234
+```
+
+Replace `1234` with a PID from `process top`. `self` selects the running SPECTRE process.
 
 Add `--json` to a headless analysis command for complete JSON Lines output. The default text view limits long evidence lists for readability.
 
@@ -71,9 +86,11 @@ spectre http http://192.0.2.10/
 
 The addresses above are documentation examples. `scope add` records the target in the local configuration; it does not probe it. A scan uses only the ports supplied or the documented default set. `investigate` checks its selected ports and, when conventional web ports are open, makes bounded HTTP follow-ups pinned to the observed addresses. HTTP inspection makes one GET request and does not follow redirects.
 
-Inside the workspace, press `/` for interactive command input and `F1` for the keyboard reference. `F2` cycles input modes while local collection continues. Assisted mode includes a six-stage local investigation without requiring a user-authored plan. Press `F6` in assisted mode to run the entire local session with one key, or reveal each prepared command by typing and run it with Enter. The stages are Environment, Collection, Initial triage, Binary inspection, Indicators, and Final review. Binary inspection prefers SPECTRE's executable when it fits the 64 MiB analyzer limit and otherwise uses a small real platform executable. The `triage` command summarizes retained observation counts, recent subjects, indicator matches, correlation links, and latest observation IDs.
+To survey the current local network segment, run `spectre lan status` to see the selected interface and exact range, then `spectre lan survey` to make real TCP probes in that range. Open web ports can receive a bounded HTTP(S) follow-up. `spectre lan off` removes the LAN stages from the default session and disables the dedicated LAN survey; `spectre lan on` enables them again. The LAN feature is available by default but does not start a survey in the background. The survey reports hosts only when their TCP responses support that observation; a silent host may still be present.
 
-Each configured exact target has a selectable scoped network scenario. `Tab` and `Shift+Tab` switch scenarios. Passive local review steps run on Enter after a full reveal; active network steps require an explicit `Ctrl+R` and still obey scope limits. Custom prepared text can also be added, but it is only recorded, never executed. Assisted mode is a deterministic presentation workflow, not an AI assistant. See [usage](docs/USAGE.md) for controls and scope.
+Inside the workspace, press `/` for interactive command input and `F1` for the keyboard reference. `F2` cycles input modes while local collection continues. Assisted mode opens on the built-in **System and network** session. Press `F6` to run the whole sequence with one key: current host and process data, interface traffic, binary inspection, and a real local-network survey when enabled. No user-authored plan is needed. The combined run has 11 stages with LAN enabled and 8 with it off. Press `F5`, then `n`, to toggle only the LAN part; local analysis still runs. Binary inspection prefers SPECTRE's executable when it fits the 64 MiB analyzer limit and otherwise uses a small real platform executable. The `triage` command summarizes retained observation counts, recent subjects, indicator matches, correlation links, and latest observation IDs.
+
+`Tab` selects focused local research, process investigation, local-network, or exact-target scenarios. For stage-by-stage use, passive review runs on Enter after a full reveal, and active network steps use `Ctrl+R`. An `F6` run performs the selected built-in session, including its active network steps. Custom prepared text can also be added, but it is only recorded, never executed. Assisted mode is a deterministic presentation workflow, not an AI assistant. See [usage](docs/USAGE.md) for controls and scope.
 
 ### Offline binary analysis session
 
