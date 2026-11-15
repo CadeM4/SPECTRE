@@ -65,13 +65,47 @@ pub fn scenarios(config: &Config) -> Vec<Scenario> {
 fn system_network(config: &Config) -> Scenario {
     let local = local_research();
     let process = process_investigation();
+    let (executable, _) = choose_binary_path(std::env::current_exe().ok(), platform_executable());
     let mut steps = vec![
         local.steps[0].clone(),
         local.steps[1].clone(),
         local.steps[2].clone(),
+        step(
+            "Live packet window",
+            "Capture real packets from the current interface and decode flows, DNS, HTTP hosts, and TLS names.",
+            "capture live auto 4 256 1536 \"ip or ip6\"",
+            Execution::Explicit,
+        ),
         process.steps[0].clone(),
         process.steps[1].clone(),
+        step(
+            "Process resources",
+            "Inspect SPECTRE's open files, descriptors, and sockets while this session is running.",
+            "runtime resources self",
+            Execution::Local,
+        ),
+        step(
+            "Call-stack sample",
+            "Sample the running SPECTRE process and identify active stack frames.",
+            "runtime sample self 1",
+            Execution::Local,
+        ),
         local.steps[4].clone(),
+        step(
+            "Disassembly",
+            "Decode instructions from an executable section of the inspected binary.",
+            format!(
+                "disasm {} 96",
+                quote_argument(&executable.to_string_lossy())
+            ),
+            Execution::Local,
+        ),
+        step(
+            "Threat intelligence",
+            "Enrich observed hashes and, when API keys are set, public network peers using external providers.",
+            "intel enrich recent",
+            Execution::Explicit,
+        ),
         local.steps[5].clone(),
     ];
     let summary = if config.lan_assessment_enabled {
@@ -79,9 +113,11 @@ fn system_network(config: &Config) -> Scenario {
         let network_summary = network.summary.clone();
         steps[0].context = format!("Check platform capabilities. {network_summary}");
         steps.extend(network.steps.into_iter().take(3));
-        format!("Run live host, process, binary and interface analysis. {network_summary}")
+        format!(
+            "Run live packets, processes, call stacks, disassembly, intelligence, and network analysis. {network_summary}"
+        )
     } else {
-        "Run a complete live host, process, binary and interface survey; LAN assessment is off."
+        "Run live packets, processes, call stacks, disassembly, and intelligence; LAN assessment is off."
             .to_owned()
     };
     steps.push(step(
@@ -495,7 +531,7 @@ mod tests {
         let available = scenarios(&config);
         let survey = &available[0];
         assert_eq!(survey.id, "system-network");
-        assert_eq!(survey.steps.len(), 11);
+        assert_eq!(survey.steps.len(), 16);
         let inputs = survey
             .steps
             .iter()
@@ -505,13 +541,22 @@ mod tests {
         assert!(inputs.contains(&"traffic snapshot"));
         assert!(inputs.contains(&"process top"));
         assert!(inputs.contains(&"process inspect self"));
+        assert!(inputs.contains(&"runtime resources self"));
+        assert!(inputs.contains(&"runtime sample self 1"));
+        assert!(
+            inputs
+                .iter()
+                .any(|input| input.starts_with("capture live "))
+        );
         assert!(inputs.iter().any(|input| input.starts_with("binary ")));
+        assert!(inputs.iter().any(|input| input.starts_with("disasm ")));
+        assert!(inputs.contains(&"intel enrich recent"));
         assert!(inputs.iter().any(|input| input.starts_with("lan survey")));
         assert_eq!(inputs.last(), Some(&"triage"));
 
         config.lan_assessment_enabled = false;
         let disabled = scenarios(&config);
-        assert_eq!(disabled[0].steps.len(), 8);
+        assert_eq!(disabled[0].steps.len(), 13);
         assert!(
             disabled[0]
                 .steps

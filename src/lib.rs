@@ -1,12 +1,15 @@
 pub mod analysis;
 pub mod assisted;
 pub mod capability;
+pub mod capture;
 pub mod command;
 pub mod config;
 pub mod detection;
 pub mod engine;
+pub mod intel;
 pub mod model;
 pub mod network;
 pub mod process;
+pub mod runtime;
 pub mod traffic;
 pub mod tui;

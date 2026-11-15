@@ -139,7 +139,7 @@ pub fn evaluate(event: &Event, indicators: &[Indicator]) -> Vec<Event> {
 fn observation_fields(event: &Event) -> Vec<(IndicatorKind, String, &'static str)> {
     let mut fields = Vec::new();
     match (event.module.as_str(), event.kind.as_str()) {
-        ("binary", "binary.identity" | "binary.container") => {
+        ("binary", "binary.identity" | "binary.container") | ("disasm", "disasm.summary") => {
             for evidence in event
                 .evidence
                 .iter()
@@ -154,7 +154,7 @@ fn observation_fields(event: &Event) -> Vec<(IndicatorKind, String, &'static str
                 );
             }
         }
-        ("pcap", "pcap.dns_question") => {
+        ("pcap", "pcap.dns_question") | ("capture", "capture.dns_question") => {
             if let Some(subject) = &event.subject {
                 let name = subject
                     .strip_suffix(']')
@@ -169,12 +169,12 @@ fn observation_fields(event: &Event) -> Vec<(IndicatorKind, String, &'static str
                 );
             }
         }
-        ("pcap", "pcap.tls_sni") => {
+        ("pcap", "pcap.tls_sni") | ("capture", "capture.tls_sni") => {
             if let Some(subject) = &event.subject {
                 push_canonical(&mut fields, IndicatorKind::Domain, subject, "subject");
             }
         }
-        ("pcap", "pcap.http_host") => {
+        ("pcap", "pcap.http_host") | ("capture", "capture.http_host") => {
             if let Some(subject) = &event.subject {
                 let host = subject
                     .rsplit_once(':')
@@ -209,7 +209,7 @@ fn observation_fields(event: &Event) -> Vec<(IndicatorKind, String, &'static str
                 );
             }
         }
-        ("pcap", "pcap.flow") => {
+        ("pcap", "pcap.flow") | ("capture", "capture.flow") => {
             for evidence in event.evidence.iter().take(16) {
                 match evidence.label.as_str() {
                     "src_ip" => push_canonical(
@@ -383,6 +383,31 @@ mod tests {
         .with_evidence("src_ip", "192.0.2.7", "capture")
         .with_evidence("dst_ip", "198.51.100.4", "capture");
         assert_eq!(evaluate(&flow, &[ip]).len(), 1);
+    }
+
+    #[test]
+    fn live_capture_and_disassembly_feed_the_same_exact_indicator_matcher() {
+        let domain = Indicator::parse("domain", "example.org", "watch").unwrap();
+        let ip = Indicator::parse("ip", "198.51.100.4", "watch").unwrap();
+        let hash = "c".repeat(64);
+        let sha = Indicator::parse("sha256", &hash, "watch").unwrap();
+        let mut dns = source("capture", "capture.dns_question", Some("Example.Org [A]"));
+        dns.source = SourceKind::Live;
+        let mut flow = source("capture", "capture.flow", Some("observed flow")).with_evidence(
+            "dst_ip",
+            "198.51.100.4",
+            "live_tcpdump_pcap",
+        );
+        flow.source = SourceKind::Live;
+        let disasm = source("disasm", "disasm.summary", Some("/bin/ls"))
+            .with_evidence("sha256", hash, "/bin/ls");
+        for (observed, indicator) in [(&dns, &domain), (&flow, &ip), (&disasm, &sha)] {
+            let matches = evaluate(observed, std::slice::from_ref(indicator));
+            assert_eq!(matches.len(), 1, "{}", observed.kind);
+            assert!(matches[0].evidence.iter().any(|evidence| {
+                evidence.label == "source_event_id" && evidence.value == observed.id
+            }));
+        }
     }
 
     #[test]

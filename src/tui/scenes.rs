@@ -22,6 +22,10 @@ const MAX_INTERFACES: usize = 24;
 const MAX_PROCESS_STARTS: usize = 16;
 const MAX_SIGNALS: usize = 48;
 const MAX_RATE_SAMPLES: usize = 36;
+const MAX_CAPTURE_ROWS: usize = 24;
+const MAX_DISASM_ROWS: usize = 96;
+const MAX_RUNTIME_ROWS: usize = 32;
+const MAX_INTEL_ROWS: usize = 32;
 const STALE_AFTER_SECONDS: i64 = 45;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,8 +35,12 @@ pub(super) enum Scene {
     Host(usize),
     Processes,
     Traffic,
+    Capture,
+    Runtime,
     Binary,
+    Disassembly,
     BinaryDetail(usize),
+    Intel,
     Timeline,
 }
 
@@ -45,8 +53,12 @@ impl Scene {
             Self::Host(_) => "HOST 02",
             Self::Processes => "PROCESSES",
             Self::Traffic => "TRAFFIC",
+            Self::Capture => "PACKETS",
+            Self::Runtime => "RUNTIME",
             Self::Binary => "BINARIES",
+            Self::Disassembly => "DISASM",
             Self::BinaryDetail(_) => "DOSSIER",
+            Self::Intel => "THREAT INTEL",
             Self::Timeline => "SIGNALS",
         }
     }
@@ -129,6 +141,63 @@ struct Signal {
     seen: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug)]
+struct CaptureView {
+    interface: String,
+    packets: String,
+    captured_bytes: String,
+    flows: String,
+    filter: String,
+    stop_reason: String,
+    seen: DateTime<Utc>,
+    flow_rows: VecDeque<Signal>,
+    name_rows: VecDeque<Signal>,
+}
+
+#[derive(Clone, Debug)]
+struct InstructionRow {
+    summary: String,
+    flow: String,
+}
+
+#[derive(Clone, Debug)]
+struct DisassemblyView {
+    subject: String,
+    section: String,
+    architecture: String,
+    instructions: String,
+    calls: u64,
+    branches: u64,
+    returns: u64,
+    sha256: String,
+    seen: DateTime<Utc>,
+    rows: VecDeque<InstructionRow>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeView {
+    pid: String,
+    subject: String,
+    sample: Option<String>,
+    resources: Option<String>,
+    trace: Option<String>,
+    hot_frames: VecDeque<String>,
+    observations: VecDeque<Signal>,
+    seen: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+struct IntelRow {
+    subject: String,
+    provider: String,
+    kind: String,
+    summary: String,
+    source_url: String,
+    details: Vec<(String, String)>,
+    severity: Severity,
+    seen: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct LiveProjection {
     segment: Option<String>,
@@ -143,6 +212,10 @@ pub(super) struct LiveProjection {
     top_processes: Vec<ProcessRow>,
     process_starts: VecDeque<ProcessRow>,
     traffic: BTreeMap<String, InterfaceRow>,
+    capture: Option<CaptureView>,
+    disassembly: Option<DisassemblyView>,
+    runtime: Option<RuntimeView>,
+    intel: VecDeque<IntelRow>,
     host_sample: Option<(String, String, String, DateTime<Utc>)>,
     binaries: VecDeque<BinaryRow>,
     indicator_matches: u64,
@@ -150,6 +223,7 @@ pub(super) struct LiveProjection {
     session_total: Option<String>,
     session_phase: Option<String>,
     session_status: Option<String>,
+    pending_scene: Option<Scene>,
 }
 
 impl LiveProjection {
@@ -203,6 +277,14 @@ impl LiveProjection {
                     .map(|count| (count.to_owned(), event.timestamp));
             }
             "traffic.interface" | "traffic.sample" => self.observe_traffic(event),
+            "capture.summary" => self.observe_capture_summary(event),
+            "capture.flow" | "capture.dns_question" | "capture.tls_sni" | "capture.http_host" => {
+                self.observe_capture_detail(event)
+            }
+            "disasm.summary" => self.observe_disassembly_summary(event),
+            "disasm.instruction" => self.observe_disassembly_instruction(event),
+            kind if kind.starts_with("runtime.") => self.observe_runtime(event),
+            kind if kind.starts_with("intel.") => self.observe_intel(event),
             "host.sample" => {
                 if let (Some(cpu), Some(used), Some(total)) = (
                     field(event, "cpu_percent"),
@@ -234,6 +316,14 @@ impl LiveProjection {
                 let index = field(event, "step_index").unwrap_or("?");
                 self.session_phase = Some(format!("{index} · {phase}"));
                 self.session_status = Some("RUNNING".to_owned());
+                self.pending_scene = field(event, "command")
+                    .map(super::scene_for_command)
+                    .filter(|scene| {
+                        matches!(
+                            scene,
+                            Scene::Capture | Scene::Runtime | Scene::Disassembly | Scene::Intel
+                        )
+                    });
                 if field(event, "command").is_some_and(|command| command.starts_with("lan survey"))
                 {
                     self.lan_hosts.clear();
@@ -252,6 +342,7 @@ impl LiveProjection {
                 } else {
                     "COMPLETE".to_owned()
                 });
+                self.pending_scene = None;
                 if field(event, "command").is_some_and(|command| command.starts_with("lan survey"))
                 {
                     self.survey_running = false;
@@ -261,6 +352,7 @@ impl LiveProjection {
                 }
             }
             "assisted.session.complete" => {
+                self.pending_scene = None;
                 self.session_phase = Some("Initial investigation complete".to_owned());
                 self.session_status = Some(event.summary.clone());
                 self.survey_running = false;
@@ -269,6 +361,7 @@ impl LiveProjection {
                 }
             }
             "assisted.session.error" => {
+                self.pending_scene = None;
                 self.session_phase = Some("Investigation stopped".to_owned());
                 self.session_status = Some(event.summary.clone());
                 self.survey_running = false;
@@ -281,6 +374,14 @@ impl LiveProjection {
                 let phase = field(event, "phase").unwrap_or("Follow-up");
                 self.session_phase = Some(format!("Live follow-up · {phase}"));
                 self.session_status = Some("RUNNING".to_owned());
+                self.pending_scene = field(event, "command")
+                    .map(super::scene_for_command)
+                    .filter(|scene| {
+                        matches!(
+                            scene,
+                            Scene::Capture | Scene::Runtime | Scene::Disassembly | Scene::Intel
+                        )
+                    });
                 if field(event, "command").is_some_and(|command| command.starts_with("lan survey"))
                 {
                     self.lan_hosts.clear();
@@ -297,17 +398,20 @@ impl LiveProjection {
                 } else {
                     "COMPLETE".to_owned()
                 });
+                self.pending_scene = None;
                 if field(event, "command").is_some_and(|command| command.starts_with("lan survey"))
                 {
                     self.survey_running = false;
                 }
             }
             "assisted.watch.complete" => {
+                self.pending_scene = None;
                 self.session_phase = Some(event.summary.clone());
                 self.session_status = Some("LIVE WATCH ACTIVE".to_owned());
                 self.survey_running = false;
             }
             "assisted.watch.error" => {
+                self.pending_scene = None;
                 self.session_phase = Some(event.summary.clone());
                 self.session_status = Some("FOLLOW-UP FAILED".to_owned());
                 self.survey_running = false;
@@ -351,11 +455,23 @@ impl LiveProjection {
         if !self.traffic.is_empty() || self.host_sample.is_some() {
             scenes.push(Scene::Traffic);
         }
+        if self.capture.is_some() || self.pending_scene == Some(Scene::Capture) {
+            scenes.push(Scene::Capture);
+        }
+        if self.runtime.is_some() || self.pending_scene == Some(Scene::Runtime) {
+            scenes.push(Scene::Runtime);
+        }
         if featured_hosts > 1 {
             scenes.push(Scene::Host(1));
         }
         if !self.binaries.is_empty() {
             scenes.push(Scene::Binary);
+        }
+        if self.disassembly.is_some() || self.pending_scene == Some(Scene::Disassembly) {
+            scenes.push(Scene::Disassembly);
+        }
+        if !self.intel.is_empty() || self.pending_scene == Some(Scene::Intel) {
+            scenes.push(Scene::Intel);
         }
         if !self.signals.is_empty() {
             scenes.push(Scene::Timeline);
@@ -379,11 +495,19 @@ impl LiveProjection {
                 .map_or(0, |host| host.observations.len().max(host.ports.len())),
             Scene::Processes => self.top_processes.len().max(self.process_starts.len()),
             Scene::Traffic => self.traffic.len(),
+            Scene::Capture => self.capture.as_ref().map_or(0, |capture| {
+                capture.flow_rows.len().max(capture.name_rows.len())
+            }),
+            Scene::Runtime => self.runtime.as_ref().map_or(0, |runtime| {
+                runtime.observations.len().max(runtime.hot_frames.len())
+            }),
             Scene::Binary => self.binaries.len(),
+            Scene::Disassembly => self.disassembly.as_ref().map_or(0, |view| view.rows.len()),
             Scene::BinaryDetail(index) => self
                 .binaries
                 .get(index)
                 .map_or(0, |row| row.observations.len()),
+            Scene::Intel => self.intel.len(),
             Scene::Timeline => self.signals.len(),
         }
     }
@@ -625,6 +749,188 @@ impl LiveProjection {
         }
     }
 
+    fn observe_capture_summary(&mut self, event: &Event) {
+        self.capture = Some(CaptureView {
+            interface: field(event, "interface")
+                .or(event.subject.as_deref())
+                .unwrap_or("unknown")
+                .to_owned(),
+            packets: field(event, "packets").unwrap_or("?").to_owned(),
+            captured_bytes: field(event, "captured_bytes").unwrap_or("?").to_owned(),
+            flows: field(event, "flows").unwrap_or("?").to_owned(),
+            filter: field(event, "filter").unwrap_or("all packets").to_owned(),
+            stop_reason: field(event, "capture_stop_reason")
+                .unwrap_or("completed")
+                .to_owned(),
+            seen: event.timestamp,
+            flow_rows: VecDeque::new(),
+            name_rows: VecDeque::new(),
+        });
+    }
+
+    fn observe_capture_detail(&mut self, event: &Event) {
+        let view = self.capture.get_or_insert_with(|| CaptureView {
+            interface: field(event, "interface").unwrap_or("unknown").to_owned(),
+            packets: "?".to_owned(),
+            captured_bytes: "?".to_owned(),
+            flows: "?".to_owned(),
+            filter: "all packets".to_owned(),
+            stop_reason: "running".to_owned(),
+            seen: event.timestamp,
+            flow_rows: VecDeque::new(),
+            name_rows: VecDeque::new(),
+        });
+        view.seen = event.timestamp;
+        let rows = if event.kind == "capture.flow" {
+            &mut view.flow_rows
+        } else {
+            &mut view.name_rows
+        };
+        push_bounded(rows, event_signal(event), MAX_CAPTURE_ROWS);
+    }
+
+    fn observe_disassembly_summary(&mut self, event: &Event) {
+        self.disassembly = Some(DisassemblyView {
+            subject: event
+                .subject
+                .clone()
+                .unwrap_or_else(|| "unknown binary".to_owned()),
+            section: field(event, "section").unwrap_or("?").to_owned(),
+            architecture: field(event, "architecture").unwrap_or("?").to_owned(),
+            instructions: field(event, "instructions_retained")
+                .unwrap_or("?")
+                .to_owned(),
+            calls: field(event, "calls")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            branches: field(event, "branches")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            returns: field(event, "returns")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            sha256: field(event, "sha256").unwrap_or("?").to_owned(),
+            seen: event.timestamp,
+            rows: VecDeque::new(),
+        });
+    }
+
+    fn observe_disassembly_instruction(&mut self, event: &Event) {
+        let subject = event.subject.as_deref().unwrap_or("unknown binary");
+        let view = self.disassembly.get_or_insert_with(|| DisassemblyView {
+            subject: subject.to_owned(),
+            section: field(event, "section").unwrap_or("?").to_owned(),
+            architecture: "?".to_owned(),
+            instructions: "?".to_owned(),
+            calls: 0,
+            branches: 0,
+            returns: 0,
+            sha256: "?".to_owned(),
+            seen: event.timestamp,
+            rows: VecDeque::new(),
+        });
+        if view.subject != subject {
+            return;
+        }
+        view.seen = event.timestamp;
+        view.rows.push_back(InstructionRow {
+            summary: event.summary.clone(),
+            flow: field(event, "flow").unwrap_or("linear").to_owned(),
+        });
+        while view.rows.len() > MAX_DISASM_ROWS {
+            view.rows.pop_front();
+        }
+    }
+
+    fn observe_runtime(&mut self, event: &Event) {
+        let pid = field(event, "pid").unwrap_or("?");
+        if self.runtime.as_ref().is_none_or(|view| view.pid != pid) {
+            self.runtime = Some(RuntimeView {
+                pid: pid.to_owned(),
+                subject: event
+                    .subject
+                    .clone()
+                    .unwrap_or_else(|| format!("pid:{pid}")),
+                sample: None,
+                resources: None,
+                trace: None,
+                hot_frames: VecDeque::new(),
+                observations: VecDeque::new(),
+                seen: event.timestamp,
+            });
+        }
+        let view = self.runtime.as_mut().expect("runtime view initialized");
+        view.seen = event.timestamp;
+        match event.kind.as_str() {
+            "runtime.sample" => {
+                view.sample = Some(event.summary.clone());
+                view.subject = event
+                    .subject
+                    .clone()
+                    .unwrap_or_else(|| format!("pid:{pid}"));
+                view.hot_frames.clear();
+                if let Some(frames) = field(event, "hot_frames") {
+                    for frame in frames
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .take(16)
+                    {
+                        view.hot_frames.push_back(frame.trim().to_owned());
+                    }
+                }
+            }
+            "runtime.resources" => view.resources = Some(event.summary.clone()),
+            "runtime.trace_summary" => view.trace = Some(event.summary.clone()),
+            "runtime.socket" | "runtime.file" | "runtime.function_call" => {
+                push_bounded(
+                    &mut view.observations,
+                    event_signal(event),
+                    MAX_RUNTIME_ROWS,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn observe_intel(&mut self, event: &Event) {
+        if matches!(
+            event.kind.as_str(),
+            "intel.status" | "intel.enrich_complete" | "intel.enrich_error"
+        ) {
+            return;
+        }
+        let details = [
+            "malicious",
+            "suspicious",
+            "abuse_confidence_score",
+            "total_reports_90d",
+            "vulnerability_name",
+            "date_added",
+            "due_date",
+            "file_name",
+            "product",
+            "interpretation",
+            "lookup_utc",
+        ]
+        .into_iter()
+        .filter_map(|key| field(event, key).map(|value| (key.to_owned(), value.to_owned())))
+        .collect();
+        push_bounded(
+            &mut self.intel,
+            IntelRow {
+                subject: event.subject.clone().unwrap_or_else(|| "query".to_owned()),
+                provider: field(event, "provider").unwrap_or("provider").to_owned(),
+                kind: event.kind.clone(),
+                summary: event.summary.clone(),
+                source_url: field(event, "source_url").unwrap_or("").to_owned(),
+                details,
+                severity: event.severity,
+                seen: event.timestamp,
+            },
+            MAX_INTEL_ROWS,
+        );
+    }
+
     fn observe_binary(&mut self, event: &Event) {
         let Some(subject) = event.subject.as_deref() else {
             return;
@@ -794,6 +1100,24 @@ fn is_signal(event: &Event) -> bool {
             | "process.start"
             | "process.batch"
             | "binary.autonomous_summary"
+            | "capture.summary"
+            | "capture.dns_question"
+            | "capture.tls_sni"
+            | "capture.http_host"
+            | "disasm.summary"
+            | "runtime.sample"
+            | "runtime.resources"
+            | "runtime.trace_summary"
+            | "intel.cisa.known_exploited"
+            | "intel.cisa.not_listed"
+            | "intel.circl.known_file"
+            | "intel.vt.report"
+            | "intel.abuseipdb.report"
+            | "intel.no_record"
+            | "intel.partial_error"
+            | "intel.status"
+            | "intel.enrich_complete"
+            | "intel.enrich_error"
             | "indicator.match"
             | "assisted.session.complete"
             | "assisted.session.error"
@@ -829,10 +1153,14 @@ pub(super) fn render_scene(
         Scene::Host(index) => render_host(frame, area, data, index, palette, scroll),
         Scene::Processes => render_processes(frame, area, data, palette, scroll),
         Scene::Traffic => render_traffic(frame, area, data, palette, scroll),
+        Scene::Capture => render_capture(frame, area, data, palette, scroll),
+        Scene::Runtime => render_runtime(frame, area, data, palette, scroll),
         Scene::Binary => render_binaries(frame, area, data, palette, scroll),
+        Scene::Disassembly => render_disassembly(frame, area, data, palette, scroll),
         Scene::BinaryDetail(index) => {
             render_binary_detail(frame, area, data, index, palette, scroll)
         }
+        Scene::Intel => render_intel(frame, area, data, palette, scroll),
         Scene::Timeline => render_timeline(frame, area, data, palette, scroll),
     }
 }
@@ -844,8 +1172,12 @@ fn scene_title(scene: Scene) -> &'static str {
         Scene::Host(_) => " HOST / LIVE DOSSIER ",
         Scene::Processes => " PROCESSES / LIVE HOST ",
         Scene::Traffic => " TRAFFIC / INTERFACES ",
+        Scene::Capture => " PACKETS / LIVE CAPTURE ",
+        Scene::Runtime => " RUNTIME / PROCESS INSPECTION ",
         Scene::Binary => " BINARIES / FILE INTELLIGENCE ",
+        Scene::Disassembly => " DISASSEMBLY / CONTROL FLOW ",
         Scene::BinaryDetail(_) => " BINARY / INSPECTION DOSSIER ",
+        Scene::Intel => " THREAT INTEL / SOURCE CONTEXT ",
         Scene::Timeline => " TIMELINE / SIGNALS ",
     }
 }
@@ -909,7 +1241,7 @@ fn accent(value: impl Into<String>, palette: Palette) -> Line<'static> {
 
 fn label_value(label: &str, value: impl Into<String>, palette: Palette) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<14}"), Style::default().fg(palette.muted)),
+        Span::styled(format!("{label:<14} "), Style::default().fg(palette.muted)),
         Span::styled(value.into(), Style::default().fg(palette.text)),
     ])
 }
@@ -934,6 +1266,29 @@ fn clip_line(value: &str, width: usize) -> String {
     } else {
         format!("{}…", truncate(value, width - 1))
     }
+}
+
+fn wrap_words(value: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in value.split_whitespace() {
+        let word_len = word.chars().count();
+        if !line.is_empty() && line.chars().count() + word_len + 1 > width {
+            lines.push(line);
+            line = String::new();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(&clip_line(word, width));
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 fn render_mission(frame: &mut Frame<'_>, area: Rect, data: &LiveProjection, palette: Palette) {
@@ -1039,6 +1394,43 @@ fn render_mission(frame: &mut Frame<'_>, area: Rect, data: &LiveProjection, pale
             palette,
         ),
     ];
+    if let Some(capture) = &data.capture {
+        sources.push(label_value(
+            "PACKETS",
+            format!(
+                "{} on {} · {}",
+                capture.packets,
+                capture.interface,
+                freshness(capture.seen)
+            ),
+            palette,
+        ));
+    }
+    if let Some(runtime) = &data.runtime {
+        sources.push(label_value(
+            "RUNTIME",
+            format!("PID {} · {}", runtime.pid, freshness(runtime.seen)),
+            palette,
+        ));
+    }
+    if let Some(disassembly) = &data.disassembly {
+        sources.push(label_value(
+            "DISASM",
+            format!(
+                "{} instructions · {}",
+                disassembly.instructions,
+                basename(&disassembly.subject)
+            ),
+            palette,
+        ));
+    }
+    if let Some(intel) = data.intel.front() {
+        sources.push(label_value(
+            "INTEL",
+            format!("{} · {}", intel.provider, freshness(intel.seen)),
+            palette,
+        ));
+    }
     if let Some((cpu, used, total, seen)) = &data.host_sample {
         let used = used
             .parse::<u64>()
@@ -1085,22 +1477,91 @@ fn render_mission(frame: &mut Frame<'_>, area: Rect, data: &LiveProjection, pale
         sources,
         palette,
     );
+    let mut recent_area = right;
+    let mut pulse = Vec::new();
+    if let Some(capture) = &data.capture {
+        let detail = capture
+            .name_rows
+            .front()
+            .or_else(|| capture.flow_rows.front())
+            .map_or_else(
+                || format!("{} packets on {}", capture.packets, capture.interface),
+                |row| row.summary.clone(),
+            );
+        pulse.push(label_value(
+            "OBSERVED / NET",
+            clip_line(&detail, right.width.saturating_sub(20) as usize),
+            palette,
+        ));
+    }
+    if let Some(runtime) = &data.runtime {
+        let detail = runtime
+            .observations
+            .front()
+            .map(|row| row.summary.as_str())
+            .or(runtime.trace.as_deref())
+            .or(runtime.sample.as_deref())
+            .or(runtime.resources.as_deref())
+            .unwrap_or("runtime inspection recorded");
+        pulse.push(label_value(
+            "OBSERVED / PID",
+            clip_line(detail, right.width.saturating_sub(20) as usize),
+            palette,
+        ));
+    }
+    if let Some(disassembly) = &data.disassembly {
+        pulse.push(label_value(
+            "DECODED / FILE",
+            format!(
+                "{} calls · {} branches · {} returns",
+                disassembly.calls, disassembly.branches, disassembly.returns
+            ),
+            palette,
+        ));
+    }
+    if let Some(intel) = data.intel.front() {
+        pulse.push(label_value(
+            "LOOKUP / INTEL",
+            clip_line(
+                &format!("{}: {}", intel.provider, intel.summary),
+                right.width.saturating_sub(20) as usize,
+            ),
+            palette,
+        ));
+    }
+    if !pulse.is_empty() && right.height >= 13 {
+        let (pulse_area, remaining) = split_vertical(right, (pulse.len() as u16 + 2).min(7));
+        render_panel(
+            frame,
+            pulse_area,
+            " INVESTIGATION PULSE / SOURCE TYPE ",
+            pulse,
+            palette,
+        );
+        recent_area = remaining;
+    }
     let mut recent = Vec::new();
     for signal in data
         .signals
         .iter()
-        .take(right.height.saturating_sub(2) as usize)
+        .take(recent_area.height.saturating_sub(2) as usize)
     {
         recent.push(signal_line(
             signal,
-            right.width.saturating_sub(3) as usize,
+            recent_area.width.saturating_sub(3) as usize,
             palette,
         ));
     }
     if recent.is_empty() {
         recent.push(muted("No high-signal observations yet", palette));
     }
-    render_panel(frame, right, " RECENT / HIGH SIGNAL ", recent, palette);
+    render_panel(
+        frame,
+        recent_area,
+        " RECENT / HIGH SIGNAL ",
+        recent,
+        palette,
+    );
 }
 
 fn render_network(
@@ -1779,6 +2240,239 @@ fn render_traffic(
     render_panel(frame, right, " ACTIVITY / RATE HISTORY ", history, palette);
 }
 
+fn render_capture(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    data: &LiveProjection,
+    palette: Palette,
+    scroll: usize,
+) {
+    let Some(view) = &data.capture else {
+        render_panel(
+            frame,
+            area,
+            scene_title(Scene::Capture),
+            vec![
+                accent("Capture stage running", palette),
+                muted(
+                    "Awaiting decoded packets from the selected interface",
+                    palette,
+                ),
+            ],
+            palette,
+        );
+        return;
+    };
+    let (header, body) = split_vertical(area, 5);
+    let bytes = view
+        .captured_bytes
+        .parse::<u64>()
+        .ok()
+        .map(format_bytes)
+        .unwrap_or_else(|| format!("{} bytes", view.captured_bytes));
+    render_panel(
+        frame,
+        header,
+        scene_title(Scene::Capture),
+        vec![
+            accent(
+                format!(
+                    "{} PACKETS  /  {}  /  {} FLOWS  /  {}",
+                    view.packets, bytes, view.flows, view.interface
+                ),
+                palette,
+            ),
+            muted(
+                format!(
+                    "tcpdump · filter {} · stop {} · {} · {}",
+                    view.filter,
+                    view.stop_reason,
+                    view.seen.format("%H:%M:%S"),
+                    age_label(view.seen)
+                ),
+                palette,
+            ),
+        ],
+        palette,
+    );
+    if body.height < 3 {
+        return;
+    }
+    let (left, right) = split_horizontal(body, 57);
+    let flow_visible = left.height.saturating_sub(2) as usize;
+    let mut flows = view
+        .flow_rows
+        .iter()
+        .skip(scroll)
+        .take(flow_visible)
+        .map(|row| {
+            Line::from(vec![
+                Span::styled("↔ ", Style::default().fg(palette.accent)),
+                Span::styled(
+                    clip_line(&row.summary, left.width.saturating_sub(5) as usize),
+                    Style::default().fg(palette.text),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if flows.is_empty() {
+        flows.push(muted("No flow decoded in this capture", palette));
+    }
+    render_panel(
+        frame,
+        left,
+        &list_title(
+            "FLOWS / OBSERVED",
+            view.flow_rows.len(),
+            scroll,
+            flow_visible,
+        ),
+        flows,
+        palette,
+    );
+    let name_visible = right.height.saturating_sub(2) as usize;
+    let mut names = view
+        .name_rows
+        .iter()
+        .skip(scroll)
+        .take(name_visible)
+        .map(|row| {
+            Line::from(vec![
+                Span::styled("● ", Style::default().fg(palette.severity(&row.severity))),
+                Span::styled(
+                    clip_line(&row.summary, right.width.saturating_sub(5) as usize),
+                    Style::default().fg(palette.text),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        names.push(muted("No DNS, HTTP or TLS name decoded", palette));
+    }
+    render_panel(
+        frame,
+        right,
+        &list_title(
+            "APPLICATION / DNS · HTTP · TLS",
+            view.name_rows.len(),
+            scroll,
+            name_visible,
+        ),
+        names,
+        palette,
+    );
+}
+
+fn render_runtime(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    data: &LiveProjection,
+    palette: Palette,
+    scroll: usize,
+) {
+    let Some(view) = &data.runtime else {
+        render_panel(
+            frame,
+            area,
+            scene_title(Scene::Runtime),
+            vec![
+                accent("Runtime stage running", palette),
+                muted("Awaiting stack, resource or function observations", palette),
+            ],
+            palette,
+        );
+        return;
+    };
+    let (header, body) = split_vertical(area, 5);
+    render_panel(
+        frame,
+        header,
+        scene_title(Scene::Runtime),
+        vec![
+            accent(
+                format!("PID {}  /  {}", view.pid, basename(&view.subject)),
+                palette,
+            ),
+            muted(
+                format!(
+                    "OS sample · open resources · function trace   /   last {} · {}",
+                    view.seen.format("%H:%M:%S"),
+                    age_label(view.seen)
+                ),
+                palette,
+            ),
+        ],
+        palette,
+    );
+    if body.height < 3 {
+        return;
+    }
+    let (left, right) = split_horizontal(body, 46);
+    let mut profile = vec![
+        muted("CALL STACK", palette),
+        text(
+            view.sample.as_deref().unwrap_or("No stack sample recorded"),
+            palette,
+        ),
+        Line::raw(""),
+        muted("RESOURCES", palette),
+        text(
+            view.resources
+                .as_deref()
+                .unwrap_or("No descriptor snapshot recorded"),
+            palette,
+        ),
+        Line::raw(""),
+        muted("FUNCTION TRACE", palette),
+        text(
+            view.trace
+                .as_deref()
+                .unwrap_or("No function trace recorded"),
+            palette,
+        ),
+    ];
+    if !view.hot_frames.is_empty() {
+        profile.push(Line::raw(""));
+        profile.push(muted("HOT FRAMES / SAMPLED", palette));
+        for (index, hot_frame) in view.hot_frames.iter().take(8).enumerate() {
+            profile.push(Line::from(vec![
+                Span::styled(
+                    format!("{:02} ", index + 1),
+                    Style::default().fg(palette.accent),
+                ),
+                Span::styled(
+                    clip_line(hot_frame, left.width.saturating_sub(7) as usize),
+                    Style::default().fg(palette.text),
+                ),
+            ]));
+        }
+    }
+    render_panel(frame, left, " PROCESS / LIVE PROFILE ", profile, palette);
+    let visible = right.height.saturating_sub(2) as usize;
+    let mut observed = view
+        .observations
+        .iter()
+        .skip(scroll)
+        .take(visible)
+        .map(|signal| signal_line(signal, right.width.saturating_sub(3) as usize, palette))
+        .collect::<Vec<_>>();
+    if observed.is_empty() {
+        observed.push(muted("No socket, file or function event recorded", palette));
+    }
+    render_panel(
+        frame,
+        right,
+        &list_title(
+            "OPEN RESOURCES / TRACE",
+            view.observations.len(),
+            scroll,
+            visible,
+        ),
+        observed,
+        palette,
+    );
+}
+
 fn render_binaries(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1907,6 +2601,245 @@ fn render_binaries(
         detail.push(muted("No binary dossier at this scroll position", palette));
     }
     render_panel(frame, right, " DOSSIER / SELECTED ", detail, palette);
+}
+
+fn render_disassembly(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    data: &LiveProjection,
+    palette: Palette,
+    scroll: usize,
+) {
+    let Some(view) = &data.disassembly else {
+        render_panel(
+            frame,
+            area,
+            scene_title(Scene::Disassembly),
+            vec![
+                accent("Disassembly stage running", palette),
+                muted(
+                    "Awaiting decoded instructions from the selected binary",
+                    palette,
+                ),
+            ],
+            palette,
+        );
+        return;
+    };
+    let (header, body) = split_vertical(area, 5);
+    render_panel(
+        frame,
+        header,
+        scene_title(Scene::Disassembly),
+        vec![
+            accent(
+                format!(
+                    "{}  /  {}  /  {} INSTRUCTIONS",
+                    basename(&view.subject),
+                    view.architecture,
+                    view.instructions
+                ),
+                palette,
+            ),
+            muted(
+                format!(
+                    "{} section · SHA-256 {} · last {}",
+                    view.section,
+                    clip_line(&view.sha256, 32),
+                    view.seen.format("%H:%M:%S")
+                ),
+                palette,
+            ),
+        ],
+        palette,
+    );
+    if body.height < 3 {
+        return;
+    }
+    let (left, right) = split_horizontal(body, 31);
+    let max_flow = view.calls.max(view.branches).max(view.returns);
+    let mut profile = vec![muted("CONTROL FLOW / DECODED", palette), Line::raw("")];
+    for (name, count) in [
+        ("CALLS", view.calls),
+        ("BRANCHES", view.branches),
+        ("RETURNS", view.returns),
+    ] {
+        profile.push(Line::from(vec![
+            Span::styled(format!("{name:<9}"), Style::default().fg(palette.muted)),
+            Span::styled(
+                scaled_bar(count, max_flow, 8),
+                Style::default().fg(palette.accent),
+            ),
+            Span::styled(format!(" {count}"), Style::default().fg(palette.text)),
+        ]));
+    }
+    profile.push(Line::raw(""));
+    profile.push(label_value("SECTION", &view.section, palette));
+    profile.push(label_value("RETAINED", &view.instructions, palette));
+    profile.push(label_value("SOURCE", "local binary", palette));
+    render_panel(frame, left, " STRUCTURE / FLOW", profile, palette);
+    let visible = right.height.saturating_sub(2) as usize;
+    let mut instructions = view
+        .rows
+        .iter()
+        .skip(scroll)
+        .take(visible)
+        .map(|row| {
+            let marker = match row.flow.as_str() {
+                "call" => "↗",
+                "branch" => "↪",
+                "return" => "↵",
+                _ => "·",
+            };
+            Line::from(vec![
+                Span::styled(format!("{marker} "), Style::default().fg(palette.accent)),
+                Span::styled(
+                    clip_line(&row.summary, right.width.saturating_sub(5) as usize),
+                    Style::default().fg(palette.text),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if instructions.is_empty() {
+        instructions.push(muted("No instruction decoded in this section", palette));
+    }
+    render_panel(
+        frame,
+        right,
+        &list_title(
+            "INSTRUCTIONS / ADDRESS ORDER",
+            view.rows.len(),
+            scroll,
+            visible,
+        ),
+        instructions,
+        palette,
+    );
+}
+
+fn render_intel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    data: &LiveProjection,
+    palette: Palette,
+    scroll: usize,
+) {
+    let Some(selected) = data.intel.get(scroll) else {
+        render_panel(
+            frame,
+            area,
+            scene_title(Scene::Intel),
+            vec![
+                accent("Threat-intelligence stage running", palette),
+                muted(
+                    "Awaiting a sourced provider report or lookup result",
+                    palette,
+                ),
+            ],
+            palette,
+        );
+        return;
+    };
+    let (header, body) = split_vertical(area, 5);
+    render_panel(
+        frame,
+        header,
+        scene_title(Scene::Intel),
+        vec![
+            accent(
+                format!(
+                    "{} PROVIDER OBSERVATIONS  /  {}",
+                    data.intel.len(),
+                    selected.subject
+                ),
+                palette,
+            ),
+            muted(
+                format!(
+                    "Latest source {} · {} · {}",
+                    selected.provider,
+                    selected.seen.format("%H:%M:%S"),
+                    age_label(selected.seen)
+                ),
+                palette,
+            ),
+        ],
+        palette,
+    );
+    if body.height < 3 {
+        return;
+    }
+    let (left, right) = split_horizontal(body, 43);
+    let visible = left.height.saturating_sub(2) as usize;
+    let mut rows = data
+        .intel
+        .iter()
+        .skip(scroll)
+        .take(visible)
+        .map(|row| {
+            Line::from(vec![
+                Span::styled(
+                    format!("{} ", row.seen.format("%H:%M")),
+                    Style::default().fg(palette.muted),
+                ),
+                Span::styled(
+                    format!("{:<14} ", clip_line(&row.provider, 14)),
+                    Style::default().fg(palette.severity(&row.severity)),
+                ),
+                Span::styled(
+                    clip_line(&row.subject, left.width.saturating_sub(24) as usize),
+                    Style::default().fg(palette.text),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        rows.push(muted("No source observation at this position", palette));
+    }
+    render_panel(
+        frame,
+        left,
+        &list_title("PROVIDERS / RECENT", data.intel.len(), scroll, visible),
+        rows,
+        palette,
+    );
+    let mut detail = vec![
+        accent(
+            clip_line(&selected.summary, right.width.saturating_sub(4) as usize),
+            palette,
+        ),
+        muted(
+            clip_line(&selected.kind, right.width.saturating_sub(4) as usize),
+            palette,
+        ),
+        Line::raw(""),
+    ];
+    for (key, value) in &selected.details {
+        if detail.len() >= right.height.saturating_sub(4) as usize {
+            break;
+        }
+        if key == "interpretation" {
+            detail.push(muted("INTERPRETATION / PROVIDER SCOPE", palette));
+            for line in wrap_words(value, right.width.saturating_sub(4) as usize) {
+                detail.push(text(line, palette));
+            }
+        } else {
+            detail.push(label_value(
+                &key.to_ascii_uppercase(),
+                clip_line(value, right.width.saturating_sub(20) as usize),
+                palette,
+            ));
+        }
+    }
+    if !selected.source_url.is_empty() {
+        detail.push(Line::raw(""));
+        detail.push(muted("SOURCE / DIRECT", palette));
+        detail.push(text(
+            clip_line(&selected.source_url, right.width.saturating_sub(4) as usize),
+            palette,
+        ));
+    }
+    render_panel(frame, right, " SOURCE / DOSSIER ", detail, palette);
 }
 
 fn render_binary_detail(
@@ -2630,5 +3563,226 @@ mod tests {
         assert!(scrolled.contains("OF 20"));
         assert!(scrolled.contains("192.168.1.10"));
         assert!(!scrolled.contains("192.168.1.20"));
+    }
+
+    #[test]
+    fn new_scenes_render_recorded_capture_disassembly_runtime_and_intel_evidence() {
+        let mut data = LiveProjection::default();
+        data.ingest(
+            &Event::new(
+                "capture",
+                "capture.summary",
+                "7 packets, 900 captured bytes, 6 IP packets, 3 flows",
+                Some("en0".into()),
+                Severity::Info,
+                SourceKind::Live,
+            )
+            .with_evidence("interface", "en0", "local_interface")
+            .with_evidence("packets", "7", "pcap_decoder")
+            .with_evidence("captured_bytes", "900", "pcap_decoder")
+            .with_evidence("flows", "3", "pcap_decoder")
+            .with_evidence("filter", "tcp or udp", "request")
+            .with_evidence("capture_stop_reason", "duration", "tcpdump"),
+        );
+        data.ingest(
+            &Event::new(
+                "capture",
+                "capture.flow",
+                "192.0.2.2:51000 → 198.51.100.9:443 TCP: 3 packets",
+                Some("en0".into()),
+                Severity::Info,
+                SourceKind::Live,
+            )
+            .with_evidence("interface", "en0", "local_interface"),
+        );
+        data.ingest(
+            &Event::new(
+                "capture",
+                "capture.tls_sni",
+                "TLS SNI observed: example.test",
+                Some("en0".into()),
+                Severity::Info,
+                SourceKind::Live,
+            )
+            .with_evidence("interface", "en0", "local_interface"),
+        );
+        data.ingest(
+            &Event::new(
+                "disasm",
+                "disasm.summary",
+                "Aarch64: 2 instructions decoded",
+                Some("/tmp/sample-bin".into()),
+                Severity::Info,
+                SourceKind::File,
+            )
+            .with_evidence("section", "__text", "file")
+            .with_evidence("architecture", "Aarch64", "file")
+            .with_evidence("instructions_retained", "2", "file")
+            .with_evidence("calls", "1", "decoded_instructions")
+            .with_evidence("branches", "0", "decoded_instructions")
+            .with_evidence("returns", "1", "decoded_instructions")
+            .with_evidence("sha256", "abc123", "file"),
+        );
+        data.ingest(
+            &Event::new(
+                "disasm",
+                "disasm.instruction",
+                "0x100003f20 bl 0x100003f90",
+                Some("/tmp/sample-bin".into()),
+                Severity::Info,
+                SourceKind::File,
+            )
+            .with_evidence("flow", "call", "instruction_classification"),
+        );
+        data.ingest(
+            &Event::new(
+                "runtime",
+                "runtime.sample",
+                "Sampled sample-bin for 2s; 200 stack observations",
+                Some("/tmp/sample-bin".into()),
+                Severity::Info,
+                SourceKind::Live,
+            )
+            .with_evidence("pid", "1234", "sample(1)")
+            .with_evidence("hot_frames", "main + 48\nwork + 12", "sample(1)"),
+        );
+        data.ingest(
+            &Event::new(
+                "runtime",
+                "runtime.resources",
+                "PID 1234: 8 descriptors, 1 sockets, 4 regular files",
+                Some("pid:1234".into()),
+                Severity::Info,
+                SourceKind::Live,
+            )
+            .with_evidence("pid", "1234", "lsof"),
+        );
+        data.ingest(
+            &Event::new(
+                "runtime",
+                "runtime.socket",
+                "PID 1234 FD 8u · 192.0.2.2:51000->198.51.100.9:443",
+                Some("pid:1234".into()),
+                Severity::Info,
+                SourceKind::Live,
+            )
+            .with_evidence("pid", "1234", "lsof"),
+        );
+        data.ingest(
+            &Event::new(
+                "intel",
+                "intel.vt.report",
+                "VirusTotal report: 2 malicious and 0 suspicious of 70 classified results",
+                Some("abc123".into()),
+                Severity::Medium,
+                SourceKind::Live,
+            )
+            .with_evidence("provider", "VirusTotal", "external_source")
+            .with_evidence(
+                "source_url",
+                "https://www.virustotal.com/gui/file/abc123",
+                "external_source",
+            )
+            .with_evidence("malicious", "2", "provider_report")
+            .with_evidence(
+                "interpretation",
+                "Provider classifications can disagree and are not proof by themselves",
+                "source_scope",
+            ),
+        );
+        data.ingest(&Event::new(
+            "intel",
+            "intel.enrich_complete",
+            "Intelligence pivot: 1 observation",
+            None,
+            Severity::Info,
+            SourceKind::Derived,
+        ));
+        assert_eq!(data.intel.len(), 1);
+        assert_eq!(data.intel.front().unwrap().provider, "VirusTotal");
+
+        for scene in [
+            Scene::Capture,
+            Scene::Disassembly,
+            Scene::Runtime,
+            Scene::Intel,
+        ] {
+            assert!(data.available_scenes().contains(&scene));
+            assert!(!render_text(scene, &data, 120, 26).is_empty());
+            let _ = render_text(scene, &data, 82, 18);
+        }
+        let capture = render_text(Scene::Capture, &data, 120, 26);
+        assert!(capture.contains("7 PACKETS"));
+        assert!(capture.contains("example.test"));
+        let disassembly = render_text(Scene::Disassembly, &data, 120, 26);
+        assert!(disassembly.contains("CONTROL FLOW"));
+        assert!(disassembly.contains("0x100003f20"));
+        let runtime = render_text(Scene::Runtime, &data, 120, 26);
+        assert!(runtime.contains("main + 48"));
+        assert!(runtime.contains("192.0.2.2"));
+        let intel = render_text(Scene::Intel, &data, 120, 26);
+        assert!(intel.contains("VirusTotal"));
+        assert!(intel.contains("classifications can disagree"));
+        assert!(intel.contains("themselves"));
+        let mission = render_text(Scene::Mission, &data, 120, 30);
+        assert!(mission.contains("OBSERVED / NET"));
+        assert!(mission.contains("DECODED / FILE"));
+        assert!(mission.contains("LOOKUP / INTEL"));
+    }
+
+    #[test]
+    fn instruction_projection_is_bounded_and_timeline_stays_high_signal() {
+        let mut data = LiveProjection::default();
+        data.ingest(&Event::new(
+            "disasm",
+            "disasm.summary",
+            "decoded section",
+            Some("/tmp/bin".into()),
+            Severity::Info,
+            SourceKind::File,
+        ));
+        for address in 0..150 {
+            data.ingest(&Event::new(
+                "disasm",
+                "disasm.instruction",
+                format!("0x{address:x} nop"),
+                Some("/tmp/bin".into()),
+                Severity::Info,
+                SourceKind::File,
+            ));
+        }
+        assert_eq!(data.scene_item_count(Scene::Disassembly), MAX_DISASM_ROWS);
+        assert!(data.signals.len() <= 1);
+        let view = render_text(Scene::Disassembly, &data, 110, 24);
+        assert!(!view.contains("0x0 nop"));
+    }
+
+    #[test]
+    fn pending_stage_has_a_view_without_claiming_an_observation() {
+        let mut data = LiveProjection::default();
+        data.ingest(
+            &Event::new(
+                "presentation",
+                "assisted.session.stage.start",
+                "Capture starting",
+                None,
+                Severity::Info,
+                SourceKind::Derived,
+            )
+            .with_evidence("command", "capture live auto", "assisted_session"),
+        );
+        assert!(data.available_scenes().contains(&Scene::Capture));
+        let view = render_text(Scene::Capture, &data, 100, 20);
+        assert!(view.contains("Awaiting decoded packets"));
+        assert!(!view.contains("7 PACKETS"));
+        data.ingest(&Event::new(
+            "presentation",
+            "assisted.session.stage",
+            "Capture failed",
+            None,
+            Severity::Low,
+            SourceKind::Derived,
+        ));
+        assert!(!data.available_scenes().contains(&Scene::Capture));
     }
 }

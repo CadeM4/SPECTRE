@@ -1,12 +1,13 @@
 use crate::{
     analysis,
     assisted::{self, Execution},
-    capability,
+    capability, capture,
     config::{Config, normalize_target},
     detection::Indicator,
     engine::EventHub,
+    intel::{self, IntelKind, Provider},
     model::{Event, Severity, SourceKind},
-    network, process, traffic,
+    network, process, runtime, traffic,
 };
 use anyhow::{Context, Result, bail};
 use std::{
@@ -326,10 +327,10 @@ async fn run_scoped_assisted_step(
         .filter(|_| index > 0)
         .context("assisted step is outside the selected scenario")?;
     if step.input != text {
-        bail!("scoped assisted action changed; reveal the stage again");
+        bail!("explicit assisted action changed; reveal the stage again");
     }
     if step.execution != Execution::Explicit || !is_scoped_assisted_command(text)? {
-        bail!("this assisted step has no explicit network action");
+        bail!("this assisted step has no executable explicit action");
     }
     execute_line(text, hub, config_path).await
 }
@@ -425,10 +426,19 @@ async fn run_full_assisted_session(
                         .find(|event| event.module == "lan" && event.kind == "lan.survey_complete")
                         .map(|event| event.id.clone());
                 }
-                succeeded += 1;
+                let problem = assisted_result_problem(&step.input, &events);
+                if problem.is_none() {
+                    succeeded += 1;
+                } else {
+                    stage.severity = Severity::Low;
+                }
                 let (event_ids, omitted) = retained_result_ids(hub, &events);
                 stage = stage
-                    .with_evidence("status", "complete", "execution")
+                    .with_evidence(
+                        "status",
+                        problem.as_ref().map_or("complete", |(status, _)| status),
+                        "execution",
+                    )
                     .with_evidence("result_event_ids", event_ids, "retained_results")
                     .with_evidence(
                         "result_event_count",
@@ -440,6 +450,9 @@ async fn run_full_assisted_session(
                         omitted.to_string(),
                         "bounded_provenance",
                     );
+                if let Some((_, explanation)) = problem {
+                    stage = stage.with_evidence("error", explanation, "provider_result");
+                }
                 output.extend(events);
             }
             Err(error) => {
@@ -493,14 +506,22 @@ async fn run_live_assisted_pulse(
     let survey_lan = include_lan && config.lan_assessment_enabled;
     let mut stages = vec![
         ("Interface traffic", "traffic snapshot"),
+        ("Live packets", "capture live auto 3 128 1024 \"ip or ip6\""),
         ("Process inventory", "process top 6"),
+        ("Process resources", "runtime resources self"),
     ];
+    if cycle.is_multiple_of(3) {
+        stages.push(("Call-stack sample", "runtime sample self 1"));
+    }
     if survey_lan {
         stages.extend([
             ("LAN context", "lan status"),
             ("LAN survey", "lan survey"),
             ("LAN review", "lan report"),
         ]);
+    }
+    if cycle.is_multiple_of(6) {
+        stages.push(("Threat intelligence", "intel enrich recent"));
     }
     stages.push(("Evidence review", "triage"));
     let started = Event::new(
@@ -565,10 +586,19 @@ async fn run_live_assisted_pulse(
                         .find(|event| event.module == "lan" && event.kind == "lan.survey_complete")
                         .map(|event| event.id.clone());
                 }
-                succeeded += 1;
+                let problem = assisted_result_problem(command, &events);
+                if problem.is_none() {
+                    succeeded += 1;
+                } else {
+                    stage.severity = Severity::Low;
+                }
                 let (event_ids, omitted) = retained_result_ids(hub, &events);
                 stage = stage
-                    .with_evidence("status", "complete", "execution")
+                    .with_evidence(
+                        "status",
+                        problem.as_ref().map_or("complete", |(status, _)| status),
+                        "execution",
+                    )
                     .with_evidence("result_event_ids", event_ids, "retained_results")
                     .with_evidence(
                         "result_event_count",
@@ -580,6 +610,9 @@ async fn run_live_assisted_pulse(
                         omitted.to_string(),
                         "bounded_provenance",
                     );
+                if let Some((_, explanation)) = problem {
+                    stage = stage.with_evidence("error", explanation, "provider_result");
+                }
                 output.extend(events);
             }
             Err(error) => {
@@ -633,7 +666,7 @@ pub async fn execute_line(line: &str, hub: &EventHub, config_path: &Path) -> Res
     hub.set_indicators(canonical_indicators.clone());
     let output = match words[0].as_str() {
         "help" => vec![Event::new("command", "command.help", "Command reference (F1 for keyboard controls)", None, Severity::Info, SourceKind::Live)
-            .with_evidence("commands", "binary <file>\npcap <file>\nprocess top [limit]|inspect <PID|self>\ntraffic snapshot\nscan <target> [ports]\ninvestigate <target> [ports]\nhttp <url>\nlan status|survey [detected CIDR]|report|on|off\nscope add|remove|list\nindicator add|remove|list\nprofile <name>|list\ntheme <name>|list\nmodule enable|disable|list\nautonomous on|off\nworkflow list|add|remove|clear\nretention [set COUNT]\ntriage\nexport <file>\ndoctor", "built_in")],
+            .with_evidence("commands", "binary <file>\ndisasm <file> [instructions]\npcap <file>\ncapture live [interface|auto] [seconds] [packets] [snaplen] [filter]\nprocess top [limit]|inspect <PID|self>\nruntime resources|sample <PID|self> [seconds]\nruntime trace <PID> <pattern> [seconds]\nintel status|enrich recent|query <provider> <ip|domain|hash|cve> <value>\ntraffic snapshot\nscan <target> [ports]\ninvestigate <target> [ports]\nhttp <url>\nlan status|survey [detected CIDR]|report|on|off\nscope add|remove|list\nindicator add|remove|list\nprofile <name>|list\ntheme <name>|list\nmodule enable|disable|list\nautonomous on|off\nworkflow list|add|remove|clear\nretention [set COUNT]\ntriage\nexport <file>\ndoctor", "built_in")],
         "doctor" => {
             let report = capability::inspect();
             let found = report.tools.iter().filter(|tool| tool.path.is_some()).count();
@@ -644,6 +677,86 @@ pub async fn execute_line(line: &str, hub: &EventHub, config_path: &Path) -> Res
             let path = PathBuf::from(&words[1]);
             tokio::task::spawn_blocking(move || analysis::analyze_binary(&path)).await??
         }
+        "disasm" if (2..=3).contains(&words.len()) => {
+            let path = PathBuf::from(&words[1]);
+            let instructions = words.get(2)
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .context("disassembly instruction limit must be a number")?
+                .unwrap_or(96);
+            analysis::disassemble_binary(&path, instructions).await?
+        }
+        "capture" if words.get(1).is_some_and(|action| action == "live") && words.len() <= 7 => {
+            let interface = match words.get(2).map(String::as_str).unwrap_or("auto") {
+                "auto" => capture::default_interface()?,
+                explicit => explicit.to_owned(),
+            };
+            let mut request = capture::CaptureRequest::new(interface);
+            request.seconds = words.get(3)
+                .map(|value| value.parse::<u64>())
+                .transpose()
+                .context("capture duration must be a number")?
+                .unwrap_or(4);
+            request.max_packets = words.get(4)
+                .map(|value| value.parse::<u32>())
+                .transpose()
+                .context("capture packet limit must be a number")?
+                .unwrap_or(256);
+            request.snaplen = words.get(5)
+                .map(|value| value.parse::<u32>())
+                .transpose()
+                .context("capture snaplen must be a number")?
+                .unwrap_or(1_536);
+            request.filter = Some(words.get(6)
+                .cloned()
+                .unwrap_or_else(|| "ip or ip6".to_owned()));
+            capture::capture_once(&request).await?
+        }
+        "runtime" if words.len() >= 3 => {
+            let pid = if words[2] == "self" {
+                std::process::id()
+            } else {
+                words[2].parse::<u32>().context("runtime expects a numeric PID or self")?
+            };
+            match words[1].as_str() {
+                "resources" if words.len() == 3 => runtime::process_resources(pid).await?,
+                "sample" if (3..=4).contains(&words.len()) => {
+                    let seconds = words.get(3)
+                        .map(|value| value.parse::<u64>())
+                        .transpose()
+                        .context("runtime sample duration must be a number")?
+                        .unwrap_or(2);
+                    runtime::sample_process(pid, seconds).await?
+                }
+                "trace" if (4..=5).contains(&words.len()) => {
+                    let seconds = words.get(4)
+                        .map(|value| value.parse::<u64>())
+                        .transpose()
+                        .context("runtime trace duration must be a number")?
+                        .unwrap_or(5);
+                    runtime::trace_functions(pid, &words[3], seconds).await?
+                }
+                _ => bail!("usage: runtime resources <PID|self>, runtime sample <PID|self> [seconds], runtime trace <PID> <pattern> [seconds]"),
+            }
+        }
+        "intel" if words.len() >= 2 => match words[1].as_str() {
+            "status" if words.len() == 2 => {
+                vec![Event::new("intel", "intel.status", "Intelligence provider availability", None, Severity::Info, SourceKind::Live)
+                    .with_evidence("cisa_kev", "ready (no key)", "provider_configuration")
+                    .with_evidence("circl_hashlookup", "ready (no key)", "provider_configuration")
+                    .with_evidence("virustotal", if configured_api_key("SPECTRE_VT_API_KEY") { "key configured" } else { "set SPECTRE_VT_API_KEY" }, "environment")
+                    .with_evidence("abuseipdb", if configured_api_key("SPECTRE_ABUSEIPDB_API_KEY") { "key configured" } else { "set SPECTRE_ABUSEIPDB_API_KEY" }, "environment")]
+            }
+            "query" if words.len() == 5 => {
+                let provider = Provider::parse(&words[2])?;
+                let kind = IntelKind::parse(&words[3])?;
+                intel::lookup(provider, kind, &words[4]).await?
+            }
+            "enrich" if words.len() == 3 && words[2] == "recent" => {
+                enrich_recent(hub).await
+            }
+            _ => bail!("usage: intel status, intel enrich recent, or intel query <auto|cisa|circl|virustotal|abuseipdb> <ip|domain|hash|cve> <value>"),
+        },
         "process" if words.len() >= 2 => match words[1].as_str() {
             "top" if (2..=3).contains(&words.len()) => {
                 let limit = words
@@ -1013,6 +1126,148 @@ pub async fn execute_line(line: &str, hub: &EventHub, config_path: &Path) -> Res
     Ok(output)
 }
 
+fn configured_api_key(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| !value.trim().is_empty())
+}
+
+fn assisted_result_problem(command: &str, events: &[Event]) -> Option<(&'static str, String)> {
+    if command != "intel enrich recent" {
+        return None;
+    }
+    let reports = events
+        .iter()
+        .find(|event| event.kind == "intel.enrich_complete")
+        .and_then(|event| event.evidence.iter().find(|item| item.label == "reports"))
+        .and_then(|item| item.value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let errors = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind.as_str(),
+                "intel.enrich_error" | "intel.partial_error"
+            )
+        })
+        .map(|event| event.summary.as_str())
+        .take(2)
+        .collect::<Vec<_>>();
+    if reports == 0 {
+        Some((
+            "error",
+            if errors.is_empty() {
+                "No retained indicator produced a provider report".to_owned()
+            } else {
+                errors.join("; ")
+            },
+        ))
+    } else if !errors.is_empty() {
+        Some(("partial", errors.join("; ")))
+    } else {
+        None
+    }
+}
+
+async fn enrich_recent(hub: &EventHub) -> Vec<Event> {
+    let snapshot = hub.snapshot();
+    let mut pivots: Vec<(IntelKind, String, String)> = Vec::new();
+    if let Some((event, hash)) = snapshot
+        .iter()
+        .rev()
+        .filter(|event| matches!(event.module.as_str(), "binary" | "disasm"))
+        .find_map(|event| {
+            event
+                .evidence
+                .iter()
+                .find(|item| item.label == "sha256" && item.value.len() == 64)
+                .map(|item| (event, item.value.clone()))
+        })
+    {
+        pivots.push((IntelKind::Hash, hash, event.id.clone()));
+    }
+    let keyed_ip =
+        configured_api_key("SPECTRE_VT_API_KEY") || configured_api_key("SPECTRE_ABUSEIPDB_API_KEY");
+    if keyed_ip {
+        let local_ips = if_addrs::get_if_addrs()
+            .map(|interfaces| {
+                interfaces
+                    .into_iter()
+                    .map(|interface| interface.ip())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let mut seen = HashSet::new();
+        for event in snapshot
+            .iter()
+            .rev()
+            .filter(|event| event.module == "capture")
+        {
+            for item in event
+                .evidence
+                .iter()
+                .filter(|item| matches!(item.label.as_str(), "src_ip" | "dst_ip"))
+            {
+                if let Ok(ip) = item.value.parse::<IpAddr>()
+                    && intel::is_public_ip(ip)
+                    && !local_ips.contains(&ip)
+                    && seen.insert(ip)
+                {
+                    pivots.push((IntelKind::Ip, ip.to_string(), event.id.clone()));
+                    if seen.len() >= 2 {
+                        break;
+                    }
+                }
+            }
+            if seen.len() >= 2 {
+                break;
+            }
+        }
+    }
+    let mut queried = 0usize;
+    let mut answered = 0usize;
+    let mut output = Vec::new();
+    for (kind, value, event_id) in pivots {
+        queried += 1;
+        match intel::lookup(Provider::Auto, kind, &value).await {
+            Ok(events) => {
+                answered += events
+                    .iter()
+                    .filter(|event| event.kind != "intel.partial_error")
+                    .count();
+                output.extend(events.into_iter().map(|event| {
+                    event.with_evidence("pivot_event_id", &event_id, "retained_observation")
+                }));
+            }
+            Err(error) => output.push(
+                Event::new(
+                    "intel",
+                    "intel.enrich_error",
+                    format!("Could not enrich observed {}: {error}", kind.as_str()),
+                    Some(value),
+                    Severity::Low,
+                    SourceKind::Derived,
+                )
+                .with_evidence("pivot_event_id", event_id, "retained_observation")
+                .with_evidence("error", error.to_string(), "provider_response"),
+            ),
+        }
+    }
+    output.push(
+        Event::new(
+            "intel",
+            "intel.enrich_complete",
+            format!("Intelligence pivot: {queried} observed indicators queried, {answered} provider reports"),
+            None,
+            if answered > 0 { Severity::Info } else { Severity::Low },
+            SourceKind::Derived,
+        )
+        .with_evidence("queried", queried.to_string(), "retained_observations")
+        .with_evidence("reports", answered.to_string(), "provider_responses")
+        .with_evidence("public_ip_providers_configured", keyed_ip.to_string(), "environment")
+        .with_evidence("selection", "latest SHA-256 and at most two distinct non-local public captured peers", "bounded_pivot"),
+    );
+    output
+}
+
 fn is_safe_local_assisted_command(line: &str) -> Result<bool> {
     let words = tokenize(line)?;
     Ok(match words.as_slice() {
@@ -1030,7 +1285,20 @@ fn is_safe_local_assisted_command(line: &str) -> Result<bool> {
             ) || command == "binary"
         }
         [command, action, target] => {
-            command == "process" && action == "inspect" && target == "self"
+            (command == "process" && action == "inspect" && target == "self")
+                || (command == "runtime" && action == "resources" && target == "self")
+                || (command == "disasm"
+                    && target
+                        .parse::<usize>()
+                        .is_ok_and(|limit| (1..=256).contains(&limit)))
+        }
+        [command, action, target, seconds] => {
+            command == "runtime"
+                && action == "sample"
+                && target == "self"
+                && seconds
+                    .parse::<u64>()
+                    .is_ok_and(|seconds| (1..=10).contains(&seconds))
         }
         _ => false,
     })
@@ -1041,6 +1309,30 @@ fn is_scoped_assisted_command(line: &str) -> Result<bool> {
     Ok(match words.as_slice() {
         [command, action] if command == "lan" && action == "survey" => true,
         [command, action, _cidr] if command == "lan" && action == "survey" => true,
+        [command, action, target]
+            if command == "intel" && action == "enrich" && target == "recent" =>
+        {
+            true
+        }
+        [
+            command,
+            action,
+            _interface,
+            seconds,
+            packets,
+            snaplen,
+            _filter,
+        ] if command == "capture" && action == "live" => {
+            seconds
+                .parse::<u64>()
+                .is_ok_and(|value| (1..=60).contains(&value))
+                && packets
+                    .parse::<u32>()
+                    .is_ok_and(|value| (1..=1024).contains(&value))
+                && snaplen
+                    .parse::<u32>()
+                    .is_ok_and(|value| (96..=2048).contains(&value))
+        }
         [command, _target] => matches!(command.as_str(), "scan" | "investigate" | "http"),
         [command, _target, _ports] => matches!(command.as_str(), "scan" | "investigate"),
         _ => false,
@@ -1062,6 +1354,10 @@ fn triage_snapshot(events: &[Event]) -> Event {
                     | "http"
                     | "lan"
                     | "traffic"
+                    | "capture"
+                    | "runtime"
+                    | "disasm"
+                    | "intel"
                     | "investigation"
             )
         })
@@ -1370,6 +1666,58 @@ mod tests {
     use super::*;
     use crate::detection::IndicatorKind;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn assisted_intelligence_stage_reports_provider_outages() {
+        let empty = Event::new(
+            "intel",
+            "intel.enrich_complete",
+            "No reports",
+            None,
+            Severity::Low,
+            SourceKind::Derived,
+        )
+        .with_evidence("reports", "0", "provider_responses");
+        assert_eq!(
+            assisted_result_problem("intel enrich recent", std::slice::from_ref(&empty))
+                .map(|(status, _)| status),
+            Some("error")
+        );
+        let report = Event::new(
+            "intel",
+            "intel.no_record",
+            "CIRCL has no report",
+            None,
+            Severity::Info,
+            SourceKind::Live,
+        );
+        let complete = Event::new(
+            "intel",
+            "intel.enrich_complete",
+            "One report",
+            None,
+            Severity::Info,
+            SourceKind::Derived,
+        )
+        .with_evidence("reports", "1", "provider_responses");
+        assert!(
+            assisted_result_problem("intel enrich recent", &[report.clone(), complete.clone()])
+                .is_none()
+        );
+        let outage = Event::new(
+            "intel",
+            "intel.enrich_error",
+            "Provider unavailable",
+            None,
+            Severity::Low,
+            SourceKind::Derived,
+        );
+        assert_eq!(
+            assisted_result_problem("intel enrich recent", &[report, outage, complete])
+                .map(|(status, _)| status),
+            Some("partial")
+        );
+    }
 
     #[test]
     fn quotes_paths_without_running_a_shell() {
@@ -1837,7 +2185,7 @@ mod tests {
                 .iter()
                 .filter(|event| event.kind == "assisted.session.stage")
                 .count(),
-            8
+            13
         );
         assert!(output.iter().any(|event| event.kind == "process.inspect"));
         assert!(output.iter().any(|event| event.kind == "traffic.snapshot"));
