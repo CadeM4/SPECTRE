@@ -3,6 +3,7 @@ use crate::{
     config::Config,
     detection::{self, Indicator},
     model::{Event, Severity, SourceKind},
+    traffic,
 };
 use anyhow::{Context, Result};
 use serde_json::to_string;
@@ -17,9 +18,9 @@ use std::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{Networks, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tokio::{
     sync::{Semaphore, broadcast, watch},
     task::JoinHandle,
@@ -28,6 +29,31 @@ use tokio::{
 
 const MAX_CORRELATED_MODULES: usize = 16;
 const BINARY_SLOTS: usize = 2;
+
+fn traffic_enabled(config: &Config) -> bool {
+    config.autonomous
+        && config
+            .enabled_modules
+            .iter()
+            .any(|module| module == "traffic")
+}
+
+fn start_traffic_counters(hub: &EventHub) -> Option<Networks> {
+    match Networks::new_with_refreshed_list() {
+        Ok(networks) => Some(networks),
+        Err(error) => {
+            hub.publish(Event::new(
+                "traffic",
+                "traffic.collector.error",
+                format!("network interface counters unavailable: {error}"),
+                None,
+                Severity::Low,
+                SourceKind::Live,
+            ));
+            None
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BinaryBudget {
@@ -139,23 +165,9 @@ pub(crate) fn referenced_source_ids(event: &Event) -> Vec<String> {
             .filter(|evidence| evidence.label == "source_event_id")
             .map(|evidence| evidence.value.clone())
             .collect(),
-        (
-            "presentation",
-            "assisted.action" | "assisted.run.complete" | "assisted.session.stage",
-        ) => event
-            .evidence
-            .iter()
-            .flat_map(|evidence| match evidence.label.as_str() {
-                "prepared_event_id" => vec![evidence.value.clone()],
-                "result_event_ids" => evidence
-                    .value
-                    .split(',')
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_owned)
-                    .collect(),
-                _ => Vec::new(),
-            })
-            .collect(),
+        // Assisted markers are operation logs. Their cited result IDs may age
+        // out of bounded history, but the progress acknowledgement must remain
+        // visible so the workspace never waits forever for a completed step.
         _ => Vec::new(),
     }
 }
@@ -330,6 +342,12 @@ pub fn spawn_autonomous(hub: EventHub, mut control: watch::Receiver<Config>) -> 
             .iter()
             .map(|(pid, process)| (pid.to_string(), process.start_time()))
             .collect();
+        let mut traffic_counters = if traffic_enabled(&config) {
+            start_traffic_counters(&hub)
+        } else {
+            None
+        };
+        let mut traffic_last_sample = Instant::now();
         let mut binary_budget = BinaryBudget::for_profile(&config.profile);
         let mut inspected_paths: HashSet<PathBuf> = HashSet::new();
         let mut baseline_queue = if config.autonomous
@@ -356,6 +374,14 @@ pub fn spawn_autonomous(hub: EventHub, mut control: watch::Receiver<Config>) -> 
                     if changed.is_err() { return; }
                     let next = control.borrow_and_update().clone();
                     let autonomous_resumed = next.autonomous && !config.autonomous;
+                    let traffic_was_enabled = traffic_enabled(&config);
+                    let traffic_now_enabled = traffic_enabled(&next);
+                    if traffic_now_enabled && !traffic_was_enabled {
+                        traffic_counters = start_traffic_counters(&hub);
+                        traffic_last_sample = Instant::now();
+                    } else if !traffic_now_enabled {
+                        traffic_counters = None;
+                    }
                     if autonomous_resumed || process_collection_resumed(&config, &next) {
                         system.refresh_processes_specifics(
                             ProcessesToUpdate::All,
@@ -420,6 +446,18 @@ pub fn spawn_autonomous(hub: EventHub, mut control: watch::Receiver<Config>) -> 
                         "sysinfo",
                     ),
                 );
+            }
+            if traffic_enabled(&config) && cycle.is_multiple_of(3) {
+                if let Some(counters) = traffic_counters.as_mut() {
+                    let elapsed = traffic_last_sample.elapsed();
+                    traffic_last_sample = Instant::now();
+                    for event in traffic::sample_networks(counters, elapsed) {
+                        hub.publish(event);
+                    }
+                } else {
+                    traffic_counters = start_traffic_counters(&hub);
+                    traffic_last_sample = Instant::now();
+                }
             }
             if !config.enabled_modules.iter().any(|m| m == "process") {
                 continue;
@@ -1077,6 +1115,44 @@ mod tests {
             receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn assisted_progress_survives_bounded_result_eviction() {
+        let hub = EventHub::new(100);
+        let first = Event::new(
+            "lan",
+            "lan.host",
+            "observed",
+            Some("192.168.1.2".into()),
+            Severity::Info,
+            SourceKind::Live,
+        );
+        let first_id = first.id.clone();
+        hub.publish(first);
+        for index in 0..150 {
+            hub.publish(Event::new(
+                "lan",
+                "lan.tcp_open",
+                index.to_string(),
+                Some("192.168.1.2".into()),
+                Severity::Info,
+                SourceKind::Live,
+            ));
+        }
+        assert!(hub.snapshot().iter().all(|event| event.id != first_id));
+        let marker = Event::new(
+            "presentation",
+            "assisted.session.stage",
+            "survey completed",
+            None,
+            Severity::Info,
+            SourceKind::Derived,
+        )
+        .with_evidence("result_event_ids", first_id, "historical_results");
+        let marker_id = marker.id.clone();
+        hub.publish(marker);
+        assert!(hub.snapshot().iter().any(|event| event.id == marker_id));
     }
 
     #[test]

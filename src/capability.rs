@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::{config::Config, network::lan};
 use serde::Serialize;
 use std::{env, io::IsTerminal, path::PathBuf};
 
@@ -26,6 +26,7 @@ pub struct ModuleCapability {
 }
 
 pub fn inspect() -> CapabilityReport {
+    let lan = lan::detect_lan();
     let tools = [
         "tshark",
         "tcpdump",
@@ -56,7 +57,20 @@ pub fn inspect() -> CapabilityReport {
             ModuleCapability {
                 name: "process".into(),
                 available: true,
-                detail: "local process inventory and changes; OS access rules apply".into(),
+                detail: "live inventory, top processes, PID inspection, and starts; OS access rules apply".into(),
+            },
+            ModuleCapability {
+                name: "traffic".into(),
+                available: true,
+                detail: "passive per-interface byte and packet counters; no packet capture".into(),
+            },
+            ModuleCapability {
+                name: "lan".into(),
+                available: lan.is_ok(),
+                detail: lan.map_or_else(
+                    |error| format!("no physical private IPv4 segment detected: {error}"),
+                    |scope| format!("active {} on {}; survey starts only on request", scope.cidr, scope.interface),
+                ),
             },
             ModuleCapability {
                 name: "binary".into(),

@@ -1,5 +1,7 @@
 //! Bounded, explicitly targeted network observations.
 
+pub mod lan;
+
 use std::collections::BTreeSet;
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
@@ -202,6 +204,27 @@ pub async fn inspect_http_at(
     timeout: Duration,
     endpoint: Option<SocketAddr>,
 ) -> Result<Vec<Event>> {
+    inspect_http_at_with_source(url, timeout, endpoint, None).await
+}
+
+/// Inspect a pinned endpoint using a requested local source IP. The IP bind
+/// constrains the outgoing socket's source address; it does not prove which
+/// physical path the operating system used.
+pub async fn inspect_http_at_from(
+    url: &str,
+    timeout: Duration,
+    endpoint: Option<SocketAddr>,
+    source_ip: IpAddr,
+) -> Result<Vec<Event>> {
+    inspect_http_at_with_source(url, timeout, endpoint, Some(source_ip)).await
+}
+
+async fn inspect_http_at_with_source(
+    url: &str,
+    timeout: Duration,
+    endpoint: Option<SocketAddr>,
+    source_ip: Option<IpAddr>,
+) -> Result<Vec<Event>> {
     if timeout.is_zero() {
         bail!("HTTP timeout must be greater than zero");
     }
@@ -233,6 +256,14 @@ pub async fn inspect_http_at(
         {
             bail!("pinned endpoint IP does not match the URL host");
         }
+        if let Some(source_ip) = source_ip
+            && !matches!(
+                (source_ip, endpoint.ip()),
+                (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+            )
+        {
+            bail!("requested local source IP family does not match the endpoint");
+        }
     }
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -240,6 +271,9 @@ pub async fn inspect_http_at(
         .connect_timeout(timeout)
         .no_proxy()
         .user_agent(concat!("spectre/", env!("CARGO_PKG_VERSION")));
+    if let Some(source_ip) = source_ip {
+        builder = builder.local_address(source_ip);
+    }
     if let Some(endpoint) = endpoint
         && subject.parse::<IpAddr>().is_err()
     {
@@ -276,6 +310,13 @@ pub async fn inspect_http_at(
     if let Some(endpoint) = endpoint {
         response_event =
             response_event.with_evidence("resolved_endpoint", endpoint.to_string(), "tcp_scan");
+    }
+    if let Some(source_ip) = source_ip {
+        response_event = response_event.with_evidence(
+            "requested_source_ip",
+            source_ip.to_string(),
+            "client_bind_configuration",
+        );
     }
     let mut events = vec![response_event];
 
@@ -661,6 +702,46 @@ mod tests {
             inspect_http_at(&url, Duration::from_secs(2), Some(wrong))
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn http_follow_up_can_bind_a_requested_local_ip() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, peer) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            peer.ip()
+        });
+        let source = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let url = format!("http://127.0.0.1:{}/", endpoint.port());
+        let events = inspect_http_at_from(&url, Duration::from_secs(2), Some(endpoint), source)
+            .await
+            .unwrap();
+        assert_eq!(server.await.unwrap(), source);
+        assert!(events.iter().any(|event| {
+            event.kind == "http_response"
+                && event.evidence.iter().any(|item| {
+                    item.label == "requested_source_ip" && item.value == source.to_string()
+                })
+        }));
+        assert!(
+            inspect_http_at_from(
+                &url,
+                Duration::from_secs(2),
+                Some(endpoint),
+                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("source IP family")
         );
     }
 

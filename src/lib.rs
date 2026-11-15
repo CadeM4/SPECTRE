@@ -7,4 +7,6 @@ pub mod detection;
 pub mod engine;
 pub mod model;
 pub mod network;
+pub mod process;
+pub mod traffic;
 pub mod tui;

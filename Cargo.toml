@@ -13,6 +13,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6", features = ["derive"] }
 crossterm = "0.29"
 dirs = "6"
+if-addrs = "0.14.0"
 object = { version = "0.40", features = ["read"] }
 ratatui = "0.30.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
