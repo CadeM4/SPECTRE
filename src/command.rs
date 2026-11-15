@@ -36,6 +36,10 @@ pub enum WorkspaceRequest {
     AssistedRunSession {
         scenario_id: String,
     },
+    AssistedLivePulse {
+        cycle: u64,
+        include_lan: bool,
+    },
 }
 
 pub async fn execute_workspace_request(
@@ -150,6 +154,25 @@ pub async fn execute_workspace_request(
                         SourceKind::Derived,
                     )
                     .with_evidence("scenario", &scenario_id, "assisted_scenario")
+                    .with_evidence("error", error.to_string(), "execution");
+                    hub.publish(acknowledgement.clone());
+                    Ok(vec![acknowledgement])
+                }
+            }
+        }
+        WorkspaceRequest::AssistedLivePulse { cycle, include_lan } => {
+            match run_live_assisted_pulse(cycle, include_lan, hub, config_path).await {
+                Ok(events) => Ok(events),
+                Err(error) => {
+                    let acknowledgement = Event::new(
+                        "presentation",
+                        "assisted.watch.error",
+                        format!("Live follow-up {cycle} failed: {error}"),
+                        None,
+                        Severity::Low,
+                        SourceKind::Derived,
+                    )
+                    .with_evidence("cycle", cycle.to_string(), "assisted_watch")
                     .with_evidence("error", error.to_string(), "execution");
                     hub.publish(acknowledgement.clone());
                     Ok(vec![acknowledgement])
@@ -352,6 +375,17 @@ async fn run_full_assisted_session(
     let mut current_lan_survey_id: Option<String> = None;
     for (position, step) in scenario.steps.iter().enumerate() {
         let index = position + 1;
+        let stage_started = assisted_ack(
+            "assisted.session.stage.start",
+            format!("{} · {} running", scenario.title, step.phase),
+            &scenario.id,
+            index,
+            Severity::Info,
+        )
+        .with_evidence("phase", &step.phase, "assisted_scenario")
+        .with_evidence("command", &step.input, "assisted_scenario");
+        hub.publish(stage_started.clone());
+        output.push(stage_started);
         let result = if step.input == "lan report" {
             match current_lan_survey_id.as_deref() {
                 Some(survey_id) => lan_report(&hub.snapshot(), Some(survey_id)).map(|report| {
@@ -444,6 +478,146 @@ async fn run_full_assisted_session(
         (scenario.steps.len() - succeeded).to_string(),
         "execution",
     );
+    hub.publish(completed.clone());
+    output.push(completed);
+    Ok(output)
+}
+
+async fn run_live_assisted_pulse(
+    cycle: u64,
+    include_lan: bool,
+    hub: &EventHub,
+    config_path: &Path,
+) -> Result<Vec<Event>> {
+    let config = Config::load_or_default(config_path)?;
+    let survey_lan = include_lan && config.lan_assessment_enabled;
+    let mut stages = vec![
+        ("Interface traffic", "traffic snapshot"),
+        ("Process inventory", "process top 6"),
+    ];
+    if survey_lan {
+        stages.extend([
+            ("LAN context", "lan status"),
+            ("LAN survey", "lan survey"),
+            ("LAN review", "lan report"),
+        ]);
+    }
+    stages.push(("Evidence review", "triage"));
+    let started = Event::new(
+        "presentation",
+        "assisted.watch.start",
+        format!("Live follow-up {cycle} started"),
+        None,
+        Severity::Info,
+        SourceKind::Derived,
+    )
+    .with_evidence("cycle", cycle.to_string(), "assisted_watch")
+    .with_evidence("lan_requested", include_lan.to_string(), "assisted_watch")
+    .with_evidence("lan_enabled", survey_lan.to_string(), "config.toml")
+    .with_evidence("stages", stages.len().to_string(), "assisted_watch");
+    hub.publish(started.clone());
+    let mut output = vec![started];
+    let mut succeeded = 0usize;
+    let mut current_lan_survey_id: Option<String> = None;
+    for (phase, command) in &stages {
+        let stage_started = Event::new(
+            "presentation",
+            "assisted.watch.stage.start",
+            format!("Live follow-up {cycle}: {phase} running"),
+            None,
+            Severity::Info,
+            SourceKind::Derived,
+        )
+        .with_evidence("cycle", cycle.to_string(), "assisted_watch")
+        .with_evidence("phase", *phase, "assisted_watch")
+        .with_evidence("command", *command, "assisted_watch");
+        hub.publish(stage_started.clone());
+        output.push(stage_started);
+        let result = if *command == "lan report" {
+            match current_lan_survey_id.as_deref() {
+                Some(survey_id) => lan_report(&hub.snapshot(), Some(survey_id)).map(|report| {
+                    hub.publish(report.clone());
+                    vec![report]
+                }),
+                None => Err(anyhow::anyhow!(
+                    "no successful LAN survey in this follow-up to review"
+                )),
+            }
+        } else {
+            execute_line(command, hub, config_path).await
+        };
+        let mut stage = Event::new(
+            "presentation",
+            "assisted.watch.stage",
+            format!("Live follow-up {cycle}: {phase}"),
+            None,
+            Severity::Info,
+            SourceKind::Derived,
+        )
+        .with_evidence("cycle", cycle.to_string(), "assisted_watch")
+        .with_evidence("phase", *phase, "assisted_watch")
+        .with_evidence("command", *command, "assisted_watch");
+        match result {
+            Ok(events) => {
+                if *command == "lan survey" {
+                    current_lan_survey_id = events
+                        .iter()
+                        .find(|event| event.module == "lan" && event.kind == "lan.survey_complete")
+                        .map(|event| event.id.clone());
+                }
+                succeeded += 1;
+                let (event_ids, omitted) = retained_result_ids(hub, &events);
+                stage = stage
+                    .with_evidence("status", "complete", "execution")
+                    .with_evidence("result_event_ids", event_ids, "retained_results")
+                    .with_evidence(
+                        "result_event_count",
+                        events.len().to_string(),
+                        "observed_results",
+                    )
+                    .with_evidence(
+                        "uncited_result_count",
+                        omitted.to_string(),
+                        "bounded_provenance",
+                    );
+                output.extend(events);
+            }
+            Err(error) => {
+                if *command == "lan survey" {
+                    current_lan_survey_id = None;
+                }
+                stage.severity = Severity::Low;
+                stage = stage
+                    .with_evidence("status", "error", "execution")
+                    .with_evidence("error", error.to_string(), "execution");
+            }
+        }
+        hub.publish(stage.clone());
+        output.push(stage);
+    }
+    let completed = Event::new(
+        "presentation",
+        "assisted.watch.complete",
+        format!(
+            "Live follow-up {cycle}: {succeeded}/{} checks complete",
+            stages.len()
+        ),
+        None,
+        if succeeded == stages.len() {
+            Severity::Info
+        } else {
+            Severity::Low
+        },
+        SourceKind::Derived,
+    )
+    .with_evidence("cycle", cycle.to_string(), "assisted_watch")
+    .with_evidence("succeeded", succeeded.to_string(), "execution")
+    .with_evidence(
+        "failed",
+        (stages.len() - succeeded).to_string(),
+        "execution",
+    )
+    .with_evidence("lan_enabled", survey_lan.to_string(), "config.toml");
     hub.publish(completed.clone());
     output.push(completed);
     Ok(output)
@@ -1669,6 +1843,62 @@ mod tests {
         assert!(output.iter().any(|event| event.kind == "traffic.snapshot"));
         assert!(output.iter().all(|event| event.module != "lan"));
         assert_eq!(output.last().unwrap().kind, "assisted.session.complete");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_follow_up_refreshes_local_evidence_and_respects_lan_off() {
+        let path = std::env::temp_dir().join(format!(
+            "spectre-live-pulse-test-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        Config {
+            lan_assessment_enabled: false,
+            ..Config::default()
+        }
+        .save(&path)
+        .unwrap();
+        let hub = EventHub::new(2_000);
+        let output = execute_workspace_request(
+            WorkspaceRequest::AssistedLivePulse {
+                cycle: 1,
+                include_lan: true,
+            },
+            &hub,
+            &path,
+        )
+        .await
+        .unwrap();
+        assert!(output.iter().any(|event| event.kind == "traffic.snapshot"));
+        assert!(
+            output
+                .iter()
+                .any(|event| event.kind == "process.top_summary")
+        );
+        assert!(
+            output
+                .iter()
+                .any(|event| event.kind == "investigation.triage")
+        );
+        assert!(output.iter().all(|event| event.module != "lan"));
+        let complete = output.last().unwrap();
+        assert_eq!(complete.kind, "assisted.watch.complete");
+        assert!(
+            complete
+                .evidence
+                .iter()
+                .any(|item| { item.label == "lan_enabled" && item.value == "false" })
+        );
+        assert!(
+            complete
+                .evidence
+                .iter()
+                .any(|item| { item.label == "failed" && item.value == "0" })
+        );
         std::fs::remove_file(path).unwrap();
     }
 

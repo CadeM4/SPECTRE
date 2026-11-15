@@ -752,7 +752,7 @@ fn schedule_binary(
         let _permit = permit;
         match analysis::analyze_binary(&path) {
             Ok(events) => {
-                for event in events {
+                for event in autonomous_binary_digest(&path, events) {
                     hub.publish(event);
                 }
             }
@@ -767,6 +767,87 @@ fn schedule_binary(
         }
     });
     true
+}
+
+/// The baseline may inspect hundreds of executables. Keep their identity and
+/// measured findings in the live stream without displacing host, process, and
+/// network observations with every section name and printable string. An
+/// explicit `binary PATH` request still publishes the full analyzer output.
+fn autonomous_binary_digest(path: &Path, events: Vec<Event>) -> Vec<Event> {
+    let analyzed_events = events.len();
+    let mut retained = Vec::new();
+    let mut sections = 0usize;
+    let mut imports = 0usize;
+    let mut libraries = 0usize;
+    let mut exports = 0usize;
+    let mut symbols = 0usize;
+    let mut strings = 0usize;
+    let mut sha256 = None;
+    for event in events {
+        match event.kind.as_str() {
+            "binary.section" => sections += 1,
+            "binary.imports" => imports += leading_count(&event.summary),
+            "binary.dependencies" => libraries += leading_count(&event.summary),
+            "binary.exports" => exports += leading_count(&event.summary),
+            "binary.symbols" => symbols += leading_count(&event.summary),
+            "binary.strings" => strings += leading_count(&event.summary),
+            "binary.container" | "binary.identity" => {
+                if sha256.is_none() {
+                    sha256 = event
+                        .evidence
+                        .iter()
+                        .find(|item| item.label == "sha256")
+                        .map(|item| item.value.clone());
+                }
+                retained.push(event);
+            }
+            "binary.entropy_observation" | "binary.partial_analysis" => retained.push(event),
+            _ => {}
+        }
+    }
+    let omitted_detail_events = analyzed_events.saturating_sub(retained.len());
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let mut digest = Event::new(
+        "binary",
+        "binary.autonomous_summary",
+        format!("Binary dossier: {name} · {sections} sections · {imports} imports"),
+        Some(path.display().to_string()),
+        Severity::Info,
+        SourceKind::File,
+    )
+    .with_evidence("path", path.display().to_string(), "filesystem")
+    .with_evidence("sections", sections.to_string(), "static_binary_analysis")
+    .with_evidence("imports", imports.to_string(), "static_binary_analysis")
+    .with_evidence("libraries", libraries.to_string(), "static_binary_analysis")
+    .with_evidence("exports", exports.to_string(), "static_binary_analysis")
+    .with_evidence("symbols", symbols.to_string(), "static_binary_analysis")
+    .with_evidence("strings", strings.to_string(), "static_binary_analysis")
+    .with_evidence(
+        "analyzed_events",
+        analyzed_events.to_string(),
+        "static_binary_analysis",
+    )
+    .with_evidence(
+        "detail_events_omitted_from_live_stream",
+        omitted_detail_events.to_string(),
+        "bounded_live_presentation",
+    );
+    if let Some(sha256) = sha256 {
+        digest = digest.with_evidence("sha256", sha256, "static_binary_analysis");
+    }
+    retained.push(digest);
+    retained
+}
+
+fn leading_count(summary: &str) -> usize {
+    summary
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
 }
 
 fn publish_baseline(hub: &EventHub, system: &System, process_count: usize) {
@@ -1049,6 +1130,86 @@ mod tests {
             baseline.front().unwrap().0,
             std::env::current_exe().unwrap()
         );
+    }
+
+    #[test]
+    fn autonomous_binary_dossiers_preserve_findings_without_eviction_flood() {
+        let hub = EventHub::new(100);
+        let host = Event::new(
+            "host",
+            "host.baseline",
+            "host observed",
+            None,
+            Severity::Info,
+            SourceKind::Live,
+        );
+        let host_id = host.id.clone();
+        hub.publish(host);
+        for index in 0..12 {
+            let path = PathBuf::from(format!("/test/executable-{index}"));
+            let subject = path.display().to_string();
+            let mut analyzed = vec![
+                Event::new(
+                    "binary",
+                    "binary.identity",
+                    "MachO Aarch64, 64-bit, 1000 bytes",
+                    Some(subject.clone()),
+                    Severity::Info,
+                    SourceKind::File,
+                )
+                .with_evidence("sha256", "a".repeat(64), &subject),
+            ];
+            for section in 0..80 {
+                analyzed.push(Event::new(
+                    "binary",
+                    "binary.section",
+                    format!("section {section}"),
+                    Some(subject.clone()),
+                    Severity::Info,
+                    SourceKind::File,
+                ));
+            }
+            analyzed.push(Event::new(
+                "binary",
+                "binary.imports",
+                "42 imports inspected; 42 retained",
+                Some(subject.clone()),
+                Severity::Info,
+                SourceKind::File,
+            ));
+            analyzed.push(Event::new(
+                "binary",
+                "binary.entropy_observation",
+                "1 section has high entropy",
+                Some(subject),
+                Severity::Low,
+                SourceKind::File,
+            ));
+            let digest = autonomous_binary_digest(&path, analyzed);
+            assert_eq!(digest.len(), 3);
+            let summary = digest.last().unwrap();
+            assert_eq!(summary.kind, "binary.autonomous_summary");
+            assert!(summary.summary.contains("80 sections · 42 imports"));
+            assert!(
+                summary
+                    .evidence
+                    .iter()
+                    .any(|item| item.label == "sha256" && item.value == "a".repeat(64))
+            );
+            for event in digest {
+                hub.publish(event);
+            }
+        }
+        let retained = hub.snapshot();
+        assert!(retained.iter().any(|event| event.id == host_id));
+        assert_eq!(
+            retained
+                .iter()
+                .filter(|event| event.kind == "binary.autonomous_summary")
+                .count(),
+            12
+        );
+        assert!(retained.iter().all(|event| event.kind != "binary.section"));
     }
 
     #[test]

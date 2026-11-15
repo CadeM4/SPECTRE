@@ -25,6 +25,9 @@ use crate::config::Config;
 use crate::engine::referenced_source_ids;
 use crate::model::{Event, Severity};
 
+mod scenes;
+use scenes::{LiveProjection, Scene, render_scene};
+
 const MINIMUM_WIDTH: u16 = 48;
 const MAX_DRAIN: usize = 512;
 
@@ -276,10 +279,30 @@ pub struct TuiState {
     pending_explicit_runs: HashSet<(String, usize)>,
     completed_explicit_runs: HashSet<(String, usize)>,
     running_session: Option<String>,
+    running_started_at: Option<Instant>,
     failed_session_stages: HashSet<(String, usize)>,
     subject_counts: BTreeMap<String, usize>,
     detail_scroll: u16,
     view: View,
+    scene: Scene,
+    scene_scroll: usize,
+    projection: LiveProjection,
+    scene_auto: bool,
+    seen_network_discoveries: HashSet<String>,
+    last_discovery_spotlight: Instant,
+    manual_scene_until: Option<Instant>,
+    last_scene_change: Instant,
+    auto_focus_step: usize,
+    live_watch: bool,
+    watch_pending: bool,
+    watch_started_at: Option<Instant>,
+    uncertain_request: bool,
+    watch_cycle: u64,
+    watch_scenario: Option<String>,
+    watch_lan_allowed: bool,
+    last_full_succeeded: Option<(usize, usize)>,
+    next_watch: Instant,
+    last_lan_watch: Instant,
     theme: Theme,
     show_help: bool,
     show_settings: bool,
@@ -324,10 +347,30 @@ impl TuiState {
             pending_explicit_runs: HashSet::new(),
             completed_explicit_runs: HashSet::new(),
             running_session: None,
+            running_started_at: None,
             failed_session_stages: HashSet::new(),
             subject_counts: BTreeMap::new(),
             detail_scroll: 0,
             view: View::Overview,
+            scene: Scene::Mission,
+            scene_scroll: 0,
+            projection: LiveProjection::default(),
+            scene_auto: true,
+            seen_network_discoveries: HashSet::new(),
+            last_discovery_spotlight: Instant::now() - Duration::from_secs(6),
+            manual_scene_until: None,
+            last_scene_change: Instant::now(),
+            auto_focus_step: 0,
+            live_watch: false,
+            watch_pending: false,
+            watch_started_at: None,
+            uncertain_request: false,
+            watch_cycle: 0,
+            watch_scenario: None,
+            watch_lan_allowed: false,
+            last_full_succeeded: None,
+            next_watch: Instant::now() + Duration::from_secs(20),
+            last_lan_watch: Instant::now(),
             theme: Theme::from_name(&config.theme),
             show_help: false,
             show_settings: false,
@@ -342,7 +385,40 @@ impl TuiState {
     }
 
     fn ingest(&mut self, observation: Event) {
+        let spotlight = match observation.kind.as_str() {
+            "lan.host" => observation
+                .subject
+                .as_ref()
+                .map(|address| (format!("host:{address}"), Scene::Network)),
+            "lan.tcp_open" => event_evidence(&observation, "endpoint")
+                .map(|endpoint| (format!("endpoint:{endpoint}"), Scene::Network)),
+            "indicator.match" => Some((format!("indicator:{}", observation.id), Scene::Timeline)),
+            _ => None,
+        };
+        let new_discovery = spotlight.as_ref().is_some_and(|(key, _)| {
+            if key.starts_with("indicator:") {
+                true
+            } else {
+                if self.seen_network_discoveries.len() >= 4096 {
+                    self.seen_network_discoveries.clear();
+                }
+                self.seen_network_discoveries.insert(key.clone())
+            }
+        });
         self.update_assisted_progress(&observation);
+        self.projection.ingest(&observation);
+        if new_discovery
+            && self.mode == InteractionMode::Assisted
+            && self.scene_auto
+            && self
+                .manual_scene_until
+                .is_none_or(|until| Instant::now() >= until)
+            && self.last_discovery_spotlight.elapsed() >= Duration::from_secs(5)
+            && let Some((_, scene)) = spotlight
+        {
+            self.focus_scene(scene);
+            self.last_discovery_spotlight = Instant::now();
+        }
         if referenced_source_ids(&observation)
             .iter()
             .any(|source_id| !self.events.iter().any(|event| event.id == *source_id))
@@ -387,6 +463,18 @@ impl TuiState {
     }
 
     fn update_assisted_progress(&mut self, event: &Event) {
+        if self.uncertain_request
+            && matches!(
+                event.kind.as_str(),
+                "assisted.session.complete"
+                    | "assisted.session.error"
+                    | "assisted.watch.complete"
+                    | "assisted.watch.error"
+            )
+        {
+            self.uncertain_request = false;
+            self.status = "Delayed completion received; F6 can start a new run".to_string();
+        }
         match event.kind.as_str() {
             "assisted.step.complete" | "assisted.step.error" => {
                 let Some(key) = assisted_event_stage_key(event) else {
@@ -442,6 +530,21 @@ impl TuiState {
                     };
                 }
             }
+            "assisted.session.stage.start" => {
+                let Some(scenario_id) = event_evidence(event, "scenario") else {
+                    return;
+                };
+                if self.running_session.as_deref() != Some(scenario_id) {
+                    return;
+                }
+                let phase = event_evidence(event, "phase").unwrap_or("stage");
+                let command = event_evidence(event, "command").unwrap_or("");
+                if command.starts_with("lan survey") {
+                    self.last_lan_watch = Instant::now();
+                }
+                self.focus_scene(scene_for_command(command));
+                self.status = format!("{} · {phase} running", session_label(scenario_id));
+            }
             "assisted.session.stage" => {
                 let Some(scenario_id) = event_evidence(event, "scenario") else {
                     return;
@@ -455,6 +558,8 @@ impl TuiState {
                     return;
                 };
                 let phase = event_evidence(event, "phase").unwrap_or("stage");
+                let command = event_evidence(event, "command").unwrap_or("");
+                self.focus_scene(scene_for_command(command));
                 let failed = event_evidence(event, "status") == Some("error");
                 if failed {
                     self.failed_session_stages
@@ -494,6 +599,7 @@ impl TuiState {
                     return;
                 }
                 self.running_session = None;
+                self.running_started_at = None;
                 self.status = if event.kind == "assisted.session.complete" {
                     let succeeded = event_evidence(event, "succeeded").unwrap_or("?");
                     let total = event_evidence(event, "failed")
@@ -507,6 +613,12 @@ impl TuiState {
                                 .map(|scenario| scenario.steps.len())
                         })
                         .unwrap_or(0);
+                    self.last_full_succeeded = succeeded
+                        .parse::<usize>()
+                        .ok()
+                        .map(|succeeded| (succeeded, total));
+                    self.next_watch = Instant::now() + Duration::from_secs(20);
+                    self.focus_scene(Scene::Mission);
                     if succeeded.parse::<usize>().ok() == Some(total) {
                         format!(
                             "{} {succeeded}/{total} stages complete",
@@ -519,7 +631,50 @@ impl TuiState {
                         )
                     }
                 } else {
+                    self.live_watch = false;
+                    self.watch_scenario = None;
                     format!("{} run stopped; F6 retries", session_label(scenario_id))
+                };
+            }
+            "assisted.watch.stage.start" => {
+                if !self.watch_pending {
+                    return;
+                }
+                let phase = event_evidence(event, "phase").unwrap_or("check");
+                let command = event_evidence(event, "command").unwrap_or("");
+                if command.starts_with("lan survey") {
+                    self.focus_scene(Scene::Network);
+                }
+                self.status = format!("Live follow-up {} · {phase} running", self.watch_cycle);
+            }
+            "assisted.watch.stage" => {
+                if !self.watch_pending {
+                    return;
+                }
+                let phase = event_evidence(event, "phase").unwrap_or("check");
+                let failed = event_evidence(event, "status") == Some("error");
+                self.status = format!(
+                    "Live follow-up {} · {phase} {}",
+                    self.watch_cycle,
+                    if failed { "failed" } else { "complete" }
+                );
+            }
+            "assisted.watch.complete" | "assisted.watch.error" => {
+                if !self.watch_pending {
+                    return;
+                }
+                self.watch_pending = false;
+                self.watch_started_at = None;
+                self.next_watch = Instant::now() + Duration::from_secs(20);
+                let succeeded = event_evidence(event, "succeeded").unwrap_or("0");
+                let failed = event_evidence(event, "failed").unwrap_or("1");
+                self.status = if event.kind == "assisted.watch.error" || failed != "0" {
+                    format!(
+                        "Live follow-up {}: {succeeded} passed, {failed} failed",
+                        self.watch_cycle
+                    )
+                } else {
+                    format!("Live follow-up {} complete", self.watch_cycle)
                 };
             }
             _ => {}
@@ -551,6 +706,13 @@ impl TuiState {
         }
         self.scenarios = scenarios;
         self.scenario_index = scenario_index;
+        if let Some(scenario_id) = self
+            .scenarios
+            .get(scenario_index)
+            .map(|scenario| scenario.id.clone())
+        {
+            self.projection.select_scenario(&scenario_id);
+        }
         self.theme = Theme::from_name(&config.theme);
         self.profile = config.profile.clone();
         self.refresh_ms = config.refresh_ms;
@@ -589,6 +751,7 @@ impl TuiState {
             (self.scenario_index + 1) % count
         };
         let scenario = &self.scenarios[self.scenario_index];
+        self.projection.select_scenario(&scenario.id);
         self.prepared = PreparedInput::new(
             scenario
                 .steps
@@ -617,7 +780,182 @@ impl TuiState {
             InteractionMode::Interactive => InteractionMode::Assisted,
             InteractionMode::Assisted => InteractionMode::Autonomous,
         };
+        if self.mode == InteractionMode::Assisted {
+            if let Some(scenario_id) = self
+                .scenarios
+                .get(self.scenario_index)
+                .map(|scenario| scenario.id.clone())
+            {
+                self.projection.select_scenario(&scenario_id);
+            }
+            self.scene = Scene::Mission;
+            self.scene_scroll = 0;
+            self.scene_auto = true;
+            self.manual_scene_until = None;
+            self.last_scene_change = Instant::now();
+            self.auto_focus_step = 0;
+        }
         self.status = format!("{} mode", self.mode.label().to_ascii_lowercase());
+    }
+
+    fn focus_scene(&mut self, scene: Scene) {
+        if self.mode == InteractionMode::Assisted
+            && self.scene_auto
+            && self
+                .manual_scene_until
+                .is_none_or(|until| Instant::now() >= until)
+        {
+            if self.scene != scene {
+                self.scene = scene;
+                self.scene_scroll = 0;
+            }
+            self.last_scene_change = Instant::now();
+        }
+    }
+
+    fn scroll_scene(&mut self, delta: isize) {
+        let max = self
+            .projection
+            .scene_item_count(self.scene)
+            .saturating_sub(1);
+        self.scene_scroll = self.scene_scroll.saturating_add_signed(delta).min(max);
+        self.manual_scene_until = Some(Instant::now() + Duration::from_secs(30));
+    }
+
+    fn next_scene_manual(&mut self) {
+        let available = self.projection.available_scenes();
+        if available.is_empty() {
+            return;
+        }
+        let index = available
+            .iter()
+            .position(|scene| *scene == self.scene)
+            .unwrap_or(0);
+        self.scene = available[(index + 1) % available.len()];
+        self.scene_scroll = 0;
+        self.manual_scene_until = Some(Instant::now() + Duration::from_secs(30));
+        self.last_scene_change = Instant::now();
+        self.status = format!("{} view selected", self.scene.label());
+    }
+
+    fn toggle_live_watch(&mut self) {
+        if self.uncertain_request {
+            self.status = "Previous request status unknown; restart SPECTRE to resume".to_string();
+            return;
+        }
+        if self.watch_scenario.is_none() {
+            self.status = "Press F6 to start a live investigation first".to_string();
+            return;
+        }
+        self.live_watch = !self.live_watch;
+        if self.live_watch {
+            self.next_watch = Instant::now();
+        }
+        self.status = if self.live_watch {
+            "Live follow-ups on".to_string()
+        } else {
+            "Live follow-ups paused".to_string()
+        };
+    }
+
+    fn tick(&mut self, command_tx: &mpsc::Sender<WorkspaceRequest>) -> bool {
+        if self.mode != InteractionMode::Assisted {
+            return false;
+        }
+        let now = Instant::now();
+        let mut changed = false;
+        if self
+            .running_started_at
+            .is_some_and(|started| now.duration_since(started) >= Duration::from_secs(120))
+        {
+            self.running_session = None;
+            self.running_started_at = None;
+            self.live_watch = false;
+            self.uncertain_request = true;
+            self.status = "Session completion not received; wait or restart SPECTRE".to_string();
+            changed = true;
+        }
+        if self
+            .watch_started_at
+            .is_some_and(|started| now.duration_since(started) >= Duration::from_secs(120))
+        {
+            self.watch_pending = false;
+            self.watch_started_at = None;
+            self.live_watch = false;
+            self.uncertain_request = true;
+            self.status = "Follow-up completion not received; wait or restart SPECTRE".to_string();
+            changed = true;
+        }
+        if self.manual_scene_until.is_some_and(|until| now >= until) {
+            self.manual_scene_until = None;
+            changed = true;
+        }
+        if self.scene_auto && self.manual_scene_until.is_none() {
+            let available = self.projection.available_scenes();
+            if !available.contains(&self.scene) {
+                self.scene = match self.scene {
+                    Scene::Host(_) if available.contains(&Scene::Network) => Scene::Network,
+                    Scene::BinaryDetail(_) if available.contains(&Scene::Binary) => Scene::Binary,
+                    _ => Scene::Mission,
+                };
+                self.scene_scroll = 0;
+                self.last_scene_change = now;
+                changed = true;
+            }
+        }
+        if self.scene_auto
+            && self.manual_scene_until.is_none()
+            && self.running_session.is_none()
+            && now.duration_since(self.last_scene_change) >= Duration::from_secs(7)
+        {
+            let available = self.projection.available_scenes();
+            if available.len() > 1 {
+                let index = available
+                    .iter()
+                    .position(|scene| *scene == self.scene)
+                    .unwrap_or(0);
+                self.scene = available[(index + 1) % available.len()];
+                self.auto_focus_step = self.auto_focus_step.wrapping_add(1);
+                let items = self.projection.scene_item_count(self.scene);
+                self.scene_scroll = if items > 0 && self.auto_focus_step >= available.len() {
+                    (self.auto_focus_step / available.len()).wrapping_mul(5) % items
+                } else {
+                    0
+                };
+                self.last_scene_change = now;
+                changed = true;
+            }
+        }
+        if self.live_watch
+            && self.running_session.is_none()
+            && !self.watch_pending
+            && self.pending_step.is_none()
+            && self.pending_explicit_runs.is_empty()
+            && now >= self.next_watch
+        {
+            let include_lan = self.watch_lan_allowed
+                && self.config.lan_assessment_enabled
+                && now.duration_since(self.last_lan_watch) >= Duration::from_secs(120);
+            let cycle = self.watch_cycle + 1;
+            match command_tx.try_send(WorkspaceRequest::AssistedLivePulse { cycle, include_lan }) {
+                Ok(()) => {
+                    self.watch_cycle = cycle;
+                    self.watch_pending = true;
+                    self.watch_started_at = Some(now);
+                    if include_lan {
+                        self.last_lan_watch = now;
+                    }
+                    self.status = format!("Live follow-up {cycle} running");
+                    changed = true;
+                }
+                Err(error) => {
+                    self.status = format!("Live follow-up could not start: {error}");
+                    self.next_watch = now + Duration::from_secs(5);
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -653,6 +991,7 @@ impl TuiState {
         if self.running_session.is_some()
             || self.pending_step.is_some()
             || !self.pending_explicit_runs.is_empty()
+            || self.watch_pending
         {
             self.status = "Wait for the current assisted work to finish".to_string();
             return;
@@ -801,6 +1140,8 @@ pub fn run_tui(
             }
         }
 
+        changed |= state.tick(&command_tx);
+
         if changed || last_draw.elapsed() >= Duration::from_millis(state.refresh_ms) {
             session.terminal.draw(|frame| render(frame, &state))?;
             last_draw = Instant::now();
@@ -858,6 +1199,9 @@ fn handle_key(
     if state.show_settings {
         match key.code {
             KeyCode::Char('t') => state.cycle_theme(command_tx),
+            KeyCode::Char('l') if state.mode == InteractionMode::Assisted => {
+                state.next_scene_manual()
+            }
             KeyCode::Char('l') => state.view = state.view.next(),
             KeyCode::Char('p') => state.cycle_profile(command_tx),
             KeyCode::Char('n') => state.toggle_lan_assessment(command_tx),
@@ -880,7 +1224,11 @@ fn handle_key(
             return false;
         }
         KeyCode::F(3) => {
-            state.view = state.view.next();
+            if state.mode == InteractionMode::Assisted {
+                state.next_scene_manual();
+            } else {
+                state.view = state.view.next();
+            }
             return false;
         }
         KeyCode::F(4) => {
@@ -891,21 +1239,51 @@ fn handle_key(
             run_assisted_session(state, command_tx);
             return false;
         }
+        KeyCode::F(7) if state.mode == InteractionMode::Assisted => {
+            state.toggle_live_watch();
+            return false;
+        }
+        KeyCode::F(8) if state.mode == InteractionMode::Assisted => {
+            state.scene_auto = !state.scene_auto;
+            state.manual_scene_until = None;
+            state.last_scene_change = Instant::now();
+            state.status = if state.scene_auto {
+                "Automatic views on".to_string()
+            } else {
+                "Automatic views paused".to_string()
+            };
+            return false;
+        }
         KeyCode::PageUp => {
-            state.move_selection(10);
+            if state.mode == InteractionMode::Assisted {
+                state.scroll_scene(-10);
+            } else {
+                state.move_selection(10);
+            }
             return false;
         }
         KeyCode::PageDown => {
-            state.move_selection(-10);
+            if state.mode == InteractionMode::Assisted {
+                state.scroll_scene(10);
+            } else {
+                state.move_selection(-10);
+            }
             return false;
         }
         _ => {}
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
+            KeyCode::Char('j') if state.mode == InteractionMode::Assisted => state.scroll_scene(1),
+            KeyCode::Char('k') if state.mode == InteractionMode::Assisted => state.scroll_scene(-1),
             KeyCode::Char('j') => state.move_selection(-1),
             KeyCode::Char('k') => state.move_selection(1),
+            KeyCode::Char('l') if state.mode == InteractionMode::Assisted => {
+                state.next_scene_manual()
+            }
             KeyCode::Char('l') => state.view = state.view.next(),
+            KeyCode::Char('u') if state.mode == InteractionMode::Assisted => state.scroll_scene(-3),
+            KeyCode::Char('d') if state.mode == InteractionMode::Assisted => state.scroll_scene(3),
             KeyCode::Char('u') => state.detail_scroll = state.detail_scroll.saturating_sub(3),
             KeyCode::Char('d') => state.detail_scroll = state.detail_scroll.saturating_add(3),
             KeyCode::Char('r') if state.mode == InteractionMode::Assisted => {
@@ -983,6 +1361,8 @@ fn handle_key(
             _ => {}
         },
         InteractionMode::Assisted => match key.code {
+            KeyCode::Up => state.scroll_scene(-1),
+            KeyCode::Down => state.scroll_scene(1),
             KeyCode::Tab => state.cycle_scenario(key.modifiers.contains(KeyModifiers::SHIFT)),
             KeyCode::BackTab => state.cycle_scenario(true),
             KeyCode::Left => state.previous_assisted_stage(),
@@ -1091,8 +1471,16 @@ fn run_assisted_explicit(state: &mut TuiState, command_tx: &mpsc::Sender<Workspa
 }
 
 fn run_assisted_session(state: &mut TuiState, command_tx: &mpsc::Sender<WorkspaceRequest>) {
+    if state.uncertain_request {
+        state.status = "Previous request status unknown; wait or restart SPECTRE".to_string();
+        return;
+    }
     if state.running_session.is_some() {
         state.status = "A session is already running".to_string();
+        return;
+    }
+    if state.watch_pending {
+        state.status = "Wait for the live follow-up to finish".to_string();
         return;
     }
     if state.pending_step.is_some() || !state.pending_explicit_runs.is_empty() {
@@ -1125,6 +1513,18 @@ fn run_assisted_session(state: &mut TuiState, command_tx: &mpsc::Sender<Workspac
         Ok(()) => {
             state.prepared = PreparedInput::new(inputs);
             state.running_session = Some(scenario_id.clone());
+            state.running_started_at = Some(Instant::now());
+            state.watch_scenario = Some(scenario_id.clone());
+            state.watch_lan_allowed =
+                matches!(scenario_id.as_str(), "system-network" | "local-network");
+            state.live_watch = true;
+            state.watch_cycle = 0;
+            state.last_full_succeeded = None;
+            state.last_lan_watch = Instant::now();
+            state.scene = Scene::Mission;
+            state.scene_scroll = 0;
+            state.last_scene_change = Instant::now();
+            state.auto_focus_step = 0;
             state
                 .failed_session_stages
                 .retain(|(id, _)| id != &scenario_id);
@@ -1142,6 +1542,24 @@ fn session_label(scenario_id: &str) -> &'static str {
         "process-investigation" => "Process",
         _ if scenario_id.starts_with("scoped-network:") => "Target",
         _ => "Assisted",
+    }
+}
+
+fn scene_for_command(command: &str) -> Scene {
+    if command.starts_with("lan ")
+        || command.starts_with("scan ")
+        || command.starts_with("investigate ")
+        || command.starts_with("http ")
+    {
+        Scene::Network
+    } else if command.starts_with("process ") {
+        Scene::Processes
+    } else if command.starts_with("traffic ") {
+        Scene::Traffic
+    } else if command.starts_with("binary ") {
+        Scene::Binary
+    } else {
+        Scene::Mission
     }
 }
 
@@ -1216,13 +1634,32 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState, palette: P
         ),
         Span::styled("/  SECURITY RESEARCH", Style::default().fg(palette.muted)),
     ]);
-    let context = format!(
-        "{}  •  {}  •  {} events  •  last {}  ",
-        state.profile,
-        state.mode.label(),
-        state.events.len(),
-        latest
-    );
+    let context = if state.mode == InteractionMode::Assisted {
+        let activity = if state.running_session.is_some() {
+            "SESSION RUNNING"
+        } else if state.watch_pending {
+            "FOLLOW-UP RUNNING"
+        } else if state.live_watch {
+            "LIVE WATCH"
+        } else {
+            "AUTO VIEWS"
+        };
+        format!(
+            "{}  •  {}  •  {} scenes  •  last {}  ",
+            state.profile,
+            activity,
+            state.projection.available_scenes().len(),
+            latest
+        )
+    } else {
+        format!(
+            "{}  •  {}  •  {} events  •  last {}  ",
+            state.profile,
+            state.mode.label(),
+            state.events.len(),
+            latest
+        )
+    };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
@@ -1241,6 +1678,17 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState, palette: P
 }
 
 fn render_workspace(frame: &mut Frame<'_>, area: Rect, state: &TuiState, palette: Palette) {
+    if state.mode == InteractionMode::Assisted {
+        render_scene(
+            frame,
+            area,
+            state.scene,
+            &state.projection,
+            palette,
+            state.scene_scroll,
+        );
+        return;
+    }
     if area.width >= 110 && state.view == View::Overview {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -1476,6 +1924,13 @@ fn render_assisted_input(frame: &mut Frame<'_>, area: Rect, state: &TuiState, pa
         );
         return;
     };
+    if state.running_session.is_none()
+        && state.watch_scenario.as_deref() == Some(scenario.id.as_str())
+        && (state.last_full_succeeded.is_some() || state.watch_cycle > 0)
+    {
+        render_assisted_watch_input(frame, area, state, scenario, palette);
+        return;
+    }
     let (stage_index, stage_count) = state.prepared.position();
     let Some(step) = state.scenario_step() else {
         frame.render_widget(
@@ -1637,6 +2092,83 @@ fn render_assisted_input(frame: &mut Frame<'_>, area: Rect, state: &TuiState, pa
     }
 }
 
+fn render_assisted_watch_input(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &TuiState,
+    scenario: &Scenario,
+    palette: Palette,
+) {
+    let run_result = state
+        .last_full_succeeded
+        .map(|(succeeded, total)| format!("Initial pass: {succeeded}/{total} stages succeeded"))
+        .unwrap_or_else(|| "Initial pass not run".to_string());
+    let activity = if state.watch_pending {
+        format!("FOLLOW-UP {} RUNNING", state.watch_cycle)
+    } else if state.live_watch {
+        "LIVE FOLLOW-UPS ON".to_string()
+    } else {
+        "FOLLOW-UPS PAUSED".to_string()
+    };
+    let next_check = if state.watch_pending {
+        "Current follow-up is collecting real observations".to_string()
+    } else if state.live_watch {
+        let seconds = state
+            .next_watch
+            .saturating_duration_since(Instant::now())
+            .as_secs();
+        let lan = if !state.watch_lan_allowed || !state.config.lan_assessment_enabled {
+            "LAN off".to_string()
+        } else {
+            let seconds = Duration::from_secs(120)
+                .saturating_sub(state.last_lan_watch.elapsed())
+                .as_secs();
+            format!("LAN refresh eligible in {seconds}s")
+        };
+        format!("Next local check in {seconds}s  ·  {lan}")
+    } else {
+        "Press F7 to resume live follow-ups".to_string()
+    };
+    let available = state
+        .projection
+        .available_scenes()
+        .iter()
+        .map(|scene| scene.label())
+        .collect::<Vec<_>>()
+        .join("  /  ");
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{}  ", scenario.title),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(activity, Style::default().fg(palette.text)),
+        ]),
+        Line::from(Span::styled(run_result, Style::default().fg(palette.text))),
+        Line::from(Span::styled(
+            format!("Current screen: {}", state.scene.label()),
+            Style::default().fg(palette.accent),
+        )),
+        Line::from(Span::styled(
+            truncate(&available, area.width.saturating_sub(4) as usize),
+            Style::default().fg(palette.muted),
+        )),
+        Line::from(Span::styled(next_check, Style::default().fg(palette.text))),
+        Line::from(Span::styled(
+            "F3 browse  ·  Up/Down scroll  ·  F8 auto views  ·  F7 pause/resume",
+            Style::default().fg(palette.muted),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(palette.surface))
+            .block(panel_block(" ASSISTED / LIVE INVESTIGATION ", palette)),
+        area,
+    );
+}
+
 fn fit_tail(value: &str, max_width: usize) -> String {
     let mut width = 0usize;
     let mut reversed = Vec::new();
@@ -1653,11 +2185,11 @@ fn fit_tail(value: &str, max_width: usize) -> String {
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState, palette: Palette) {
     let shortcuts = if state.mode == InteractionMode::Assisted && area.width >= 112 {
-        "F6 Run all  F1 Help  F2 Mode  Tab Scenario  Left Prev  Ctrl+R Step"
+        "F3 Screen  F6 Run  F7 Watch  F8 Auto  F5 Setup  Tab Scenario"
     } else if state.mode == InteractionMode::Assisted && area.width >= 78 {
-        "F6 Run  F2 Mode  Tab Next  Left Prev  Ctrl+R"
+        "F3 Screen  F6 Run  F7 Watch  F8 Auto  Tab Next"
     } else if state.mode == InteractionMode::Assisted {
-        "F6 Run  F2 Mode  F1 Help"
+        "F3 View  F6 Run  F7 Watch  F1 Help"
     } else if area.width >= 112 {
         "F1 Help  F2 Mode  F3 View  F4 Theme  F5 Settings  Ctrl+J/K Select  Ctrl+U/D Evidence  Ctrl+C Exit"
     } else {
@@ -1671,7 +2203,12 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState, palette: P
         Paragraph::new(shortcuts).style(Style::default().fg(palette.muted).bg(palette.background)),
         columns[0],
     );
-    let status = format!("{}  ·  {}", state.view.label(), state.status);
+    let view_label = if state.mode == InteractionMode::Assisted {
+        state.scene.label()
+    } else {
+        state.view.label()
+    };
+    let status = format!("{}  ·  {}", view_label, state.status);
     let status = fit_tail(&status, columns[1].width as usize);
     frame.render_widget(
         Paragraph::new(status)
@@ -1686,24 +2223,24 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, palette: Palette) {
     frame.render_widget(Clear, popup);
     let help = [
         "SPECTRE / KEYBOARD",
-        "",
         "F2             Cycle autonomous, interactive and assisted input",
-        "F3             Cycle overview, timeline and evidence views",
+        "F3             Browse and hold a screen for 30 seconds",
         "F4             Cycle theme                    F5  Settings",
-        "Ctrl+J / K     Select newer / older observation",
-        "Ctrl+U / D     Scroll evidence up / down",
-        "Page Down / Up Select newer / older observations by ten",
+        "F7             Pause / resume live follow-ups",
+        "F8             Pause / resume automatic screen changes",
+        "Ctrl+J / K     Scroll Assisted; select observations otherwise",
+        "Ctrl+U / D     Scroll Assisted; scroll evidence otherwise",
+        "Page Down / Up Scroll Assisted; select ten observations otherwise",
         "AUTONOMOUS     / opens command input; Up/Down inspect events",
         "INTERACTIVE    Enter submits command; Up/Down recall history",
-        "ASSISTED       Tab / Shift+Tab selects a guided scenario",
+        "ASSISTED       Up/Down scroll; Tab / Shift+Tab selects a scenario",
         "               Left revisits; Esc resets a stage to rerun",
         "               Each character reveals one prepared character",
         "               Enter runs local steps, records and advances",
-        "               F6 runs the full selected built-in session",
+        "               F6 runs the full session and starts live follow-ups",
         "               Ctrl+R runs a revealed network step",
         "               Custom steps are recorded, never executed",
-        "               F5 then n toggles the LAN survey scenario",
-        "",
+        "               F5 then n toggles LAN assessment",
         "Esc closes this panel. Ctrl+C exits.",
     ];
     frame.render_widget(
@@ -1717,11 +2254,16 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, palette: Palette) {
 fn render_settings(frame: &mut Frame<'_>, area: Rect, state: &TuiState, palette: Palette) {
     let popup = centered(area, 64, 18);
     frame.render_widget(Clear, popup);
+    let arrangement = if state.mode == InteractionMode::Assisted {
+        state.scene.label().to_ascii_lowercase()
+    } else {
+        state.view.label().to_ascii_lowercase()
+    };
     let content = format!(
-        "WORKSPACE SETTINGS\n\n  p  Profile            {}\n  t  Theme              {}\n  l  Arrangement        {}\n  r  Display refresh    {} ms\n  a  Autonomous work    {}\n  n  LAN survey         {}\n\nSettings are saved; arrangement is session-only.\nAssisted LAN traffic starts with F6 or Ctrl+R.\nExact targets: spectre scope add/remove HOST\n\nEsc closes settings.",
+        "WORKSPACE SETTINGS\n\n  p  Profile            {}\n  t  Theme              {}\n  l  Arrangement        {}\n  r  Display refresh    {} ms\n  a  Autonomous work    {}\n  n  LAN survey         {}\n\nSettings are saved; arrangement is session-only.\nF6 starts live Assisted follow-ups; F7 pauses them.\nLAN refreshes while watch is on, unless turned off.\n\nEsc closes settings.",
         state.profile,
         state.theme.label(),
-        state.view.label().to_ascii_lowercase(),
+        arrangement,
         state.refresh_ms,
         if state.config.autonomous { "on" } else { "off" },
         if state.config.lan_assessment_enabled {
@@ -1905,6 +2447,298 @@ mod tests {
         assert_eq!(state.scenario().unwrap().id, "system-network");
         assert!(state.prepared.steps.len() >= 8);
         assert!(state.prepared.current().is_some());
+    }
+
+    #[test]
+    fn assisted_stage_focus_and_auto_rotation_show_distinct_real_scenes() {
+        let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        state.running_session = Some("system-network".into());
+        state.ingest(
+            Event::new(
+                "lan",
+                "lan.status",
+                "Active private IPv4 segment",
+                Some("192.168.1.0/24".into()),
+                Severity::Info,
+                SourceKind::Live,
+            )
+            .with_evidence("cidr", "192.168.1.0/24", "test"),
+        );
+        state.ingest(
+            assisted_event("assisted.session.stage.start", "system-network", 9)
+                .with_evidence("phase", "Host and service survey", "test")
+                .with_evidence("command", "lan survey 192.168.1.0/24", "test"),
+        );
+        assert_eq!(state.scene, Scene::Network);
+        let network = render_state_to_text(&state, 120, 30);
+        assert!(network.contains("NETWORK / LAN SURVEY"));
+        assert!(network.contains("192.168.1.0/24"));
+        assert!(!network.contains("SUBJECTS"));
+        state.running_session = None;
+        state.last_scene_change = Instant::now() - Duration::from_secs(8);
+        let (tx, _rx) = mpsc::channel(4);
+        assert!(state.tick(&tx));
+        assert_ne!(state.scene, Scene::Network);
+        let next = render_state_to_text(&state, 120, 30);
+        assert_ne!(network, next);
+    }
+
+    #[test]
+    fn live_watch_queues_one_pulse_and_respects_lan_interval() {
+        let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        state.live_watch = true;
+        state.watch_scenario = Some("system-network".into());
+        state.watch_lan_allowed = true;
+        state.next_watch = Instant::now() - Duration::from_secs(1);
+        state.last_lan_watch = Instant::now() - Duration::from_secs(121);
+        let (tx, mut rx) = mpsc::channel(4);
+        assert!(state.tick(&tx));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            WorkspaceRequest::AssistedLivePulse {
+                cycle: 1,
+                include_lan: true
+            }
+        );
+        state.next_watch = Instant::now() - Duration::from_secs(1);
+        state.tick(&tx);
+        assert!(rx.try_recv().is_err());
+        state.ingest(
+            Event::new(
+                "presentation",
+                "assisted.watch.complete",
+                "Live follow-up complete",
+                None,
+                Severity::Info,
+                SourceKind::Derived,
+            )
+            .with_evidence("succeeded", "6", "test")
+            .with_evidence("failed", "0", "test"),
+        );
+        assert!(!state.watch_pending);
+        state.next_watch = Instant::now() - Duration::from_secs(1);
+        assert!(state.tick(&tx));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            WorkspaceRequest::AssistedLivePulse {
+                cycle: 2,
+                include_lan: false
+            }
+        );
+    }
+
+    #[test]
+    fn local_follow_up_does_not_restart_the_screen_rotation() {
+        let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        state.watch_pending = true;
+        state.watch_cycle = 1;
+        state.scene = Scene::Binary;
+        state.last_scene_change = Instant::now() - Duration::from_secs(3);
+        let previous = state.last_scene_change;
+        state.ingest(
+            Event::new(
+                "presentation",
+                "assisted.watch.stage.start",
+                "Traffic refresh running",
+                None,
+                Severity::Info,
+                SourceKind::Derived,
+            )
+            .with_evidence("phase", "Interface traffic", "test")
+            .with_evidence("command", "traffic snapshot", "test"),
+        );
+        assert_eq!(state.scene, Scene::Binary);
+        assert_eq!(state.last_scene_change, previous);
+        state.ingest(
+            Event::new(
+                "presentation",
+                "assisted.watch.stage.start",
+                "LAN refresh running",
+                None,
+                Severity::Info,
+                SourceKind::Derived,
+            )
+            .with_evidence("phase", "LAN survey", "test")
+            .with_evidence("command", "lan survey", "test"),
+        );
+        assert_eq!(state.scene, Scene::Network);
+    }
+
+    #[test]
+    fn newly_observed_lan_host_spotlights_network_without_repeating_old_host() {
+        let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        let host = |address: &str| {
+            Event::new(
+                "lan",
+                "lan.host",
+                format!("{address} answered TCP probes"),
+                Some(address.to_string()),
+                Severity::Info,
+                SourceKind::Live,
+            )
+            .with_evidence("address", address, "test")
+        };
+        state.ingest(host("192.168.1.10"));
+        assert_eq!(state.scene, Scene::Network);
+        state.scene = Scene::Mission;
+        state.last_discovery_spotlight = Instant::now() - Duration::from_secs(6);
+        state.ingest(host("192.168.1.10"));
+        assert_eq!(state.scene, Scene::Mission);
+        state.ingest(host("192.168.1.11"));
+        assert_eq!(state.scene, Scene::Network);
+    }
+
+    #[test]
+    fn assisted_scroll_holds_scene_and_moves_visible_evidence() {
+        let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        for number in 1..=15 {
+            let address = format!("192.168.1.{number}");
+            state.ingest(Event::new(
+                "lan",
+                "lan.host",
+                format!("{address} answered TCP probes"),
+                Some(address),
+                Severity::Info,
+                SourceKind::Live,
+            ));
+        }
+        state.scene = Scene::Network;
+        state.last_scene_change = Instant::now() - Duration::from_secs(8);
+        let (tx, _rx) = mpsc::channel(4);
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(state.scene_scroll, 10);
+        assert!(state.manual_scene_until.is_some());
+        assert!(render_state_to_text(&state, 120, 30).contains("11–15 OF 15"));
+        state.tick(&tx);
+        assert_eq!(state.scene, Scene::Network);
+    }
+
+    #[test]
+    fn failed_full_run_does_not_start_follow_ups() {
+        let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        let (tx, mut rx) = mpsc::channel(4);
+        run_assisted_session(&mut state, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            WorkspaceRequest::AssistedRunSession { .. }
+        ));
+        state.ingest(
+            Event::new(
+                "presentation",
+                "assisted.session.error",
+                "Session could not start",
+                None,
+                Severity::Low,
+                SourceKind::Derived,
+            )
+            .with_evidence("scenario", "system-network", "test"),
+        );
+        assert!(!state.live_watch);
+        assert!(state.watch_scenario.is_none());
+        state.next_watch = Instant::now() - Duration::from_secs(1);
+        state.tick(&tx);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn scenario_change_switches_network_context_away_from_prior_target() {
+        let config = Config {
+            allowed_targets: vec!["example.org".into()],
+            ..Config::default()
+        };
+        let mut state = TuiState::new(config, PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        select_scenario(&mut state, "scoped-network:example.org");
+        state.ingest(
+            Event::new(
+                "network",
+                "tcp_scan_complete",
+                "example.org scan complete",
+                Some("example.org".into()),
+                Severity::Info,
+                SourceKind::Live,
+            )
+            .with_evidence("target", "example.org", "test"),
+        );
+        state.scene = Scene::Network;
+        assert!(render_state_to_text(&state, 120, 30).contains("NETWORK / SCOPED TARGET"));
+        select_scenario(&mut state, "system-network");
+        let screen = render_state_to_text(&state, 120, 30);
+        assert!(screen.contains("NETWORK / LAN SURVEY"));
+        assert!(!screen.contains("NETWORK / SCOPED TARGET"));
+    }
+
+    #[test]
+    fn disappearing_host_dossier_returns_to_network_during_resurvey() {
+        let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        state.ingest(
+            Event::new(
+                "lan",
+                "lan.host",
+                "Host answered",
+                Some("192.168.1.4".into()),
+                Severity::Info,
+                SourceKind::Live,
+            )
+            .with_evidence("segment", "192.168.1.0/24", "test"),
+        );
+        assert!(
+            state
+                .projection
+                .available_scenes()
+                .contains(&Scene::Host(0))
+        );
+        state.scene = Scene::Host(0);
+        state.ingest(
+            Event::new(
+                "presentation",
+                "assisted.watch.stage.start",
+                "LAN resurvey running",
+                None,
+                Severity::Info,
+                SourceKind::Derived,
+            )
+            .with_evidence("command", "lan survey", "test"),
+        );
+        let (tx, _rx) = mpsc::channel(4);
+        assert!(state.tick(&tx));
+        assert_eq!(state.scene, Scene::Network);
+    }
+
+    #[test]
+    fn missing_completion_event_does_not_leave_assisted_stuck_forever() {
+        let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        state.live_watch = true;
+        state.running_session = Some("system-network".into());
+        state.running_started_at = Some(Instant::now() - Duration::from_secs(121));
+        state.next_watch = Instant::now() + Duration::from_secs(20);
+        let (tx, _rx) = mpsc::channel(4);
+        assert!(state.tick(&tx));
+        assert!(state.running_session.is_none());
+        assert!(!state.live_watch);
+        assert!(state.uncertain_request);
+        assert!(state.status.contains("completion not received"));
+
+        state.live_watch = true;
+        state.watch_pending = true;
+        state.watch_started_at = Some(Instant::now() - Duration::from_secs(121));
+        assert!(state.tick(&tx));
+        assert!(!state.watch_pending);
+        assert!(!state.live_watch);
+        assert!(state.uncertain_request);
+        assert!(state.status.contains("Follow-up completion not received"));
     }
 
     #[test]
@@ -2357,7 +3191,7 @@ mod tests {
         state.show_help = true;
         let screen = render_state_to_text(&state, 80, 24);
         assert!(
-            screen.contains("F5 then n toggles the LAN survey"),
+            screen.contains("F5 then n toggles LAN assessment"),
             "{screen}"
         );
         assert!(screen.contains("Esc closes this panel."), "{screen}");
@@ -2653,7 +3487,7 @@ mod tests {
         state.status = "Local 7/7 stages complete".into();
         let screen = render_state_to_text(&state, 120, 30);
         let footer = screen.lines().last().unwrap();
-        assert!(footer.contains("Ctrl+R Step"), "{footer}");
+        assert!(footer.contains("F7 Watch"), "{footer}");
         assert!(footer.contains("7/7 stages complete"), "{footer}");
     }
 

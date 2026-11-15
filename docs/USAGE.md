@@ -83,27 +83,32 @@ Replace `self` with a PID from `process top` to inspect that process. Process in
 | --- | --- |
 | `F1` | Open or close help. |
 | `F2` | Cycle autonomous, interactive, and assisted input modes. |
-| `F3` | Cycle overview, timeline, and evidence views. |
+| `F3` | In Assisted, browse scenes. The selected scene stays pinned for 30 seconds, then automatic changes resume if enabled. |
 | `F4` | Cycle the four themes. |
 | `F5` | Open workspace settings. |
-| `F6` in assisted mode | Run every stage of the selected built-in session with one key. The first/default session includes a real LAN survey when LAN assessment is on. |
+| `F6` in assisted mode | Run every stage of the selected built-in session with one key and start ongoing live follow-ups. The first/default session includes a real LAN survey when LAN assessment is on. |
+| `F7` in assisted mode | Pause or resume ongoing Assisted follow-ups. |
+| `F8` in assisted mode | Turn automatic scene changes on or off. Analysis continues while scenes are held. |
+| `Up` / `Down` or `PageUp` / `PageDown` in assisted mode | Scroll the current scene by one row or ten rows. Scrolling holds that scene for 30 seconds. |
 | `Tab` / `Shift+Tab` in assisted mode | Select the next or previous built-in or custom scenario. |
 | `Left` in assisted mode | Return to the previous stage and reset its prepared input. |
 | `Enter` in assisted mode | After a full reveal, run a local built-in step; record and advance an active network or custom step without running it. |
 | `Ctrl+R` in assisted mode | Explicitly run a fully revealed active step in a network scenario. |
 | `Ctrl+J` / `Ctrl+K` | Select newer or older observation. |
-| `PageDown` / `PageUp` | Move selection by ten observations. |
+| `PageDown` / `PageUp` outside assisted mode | Move selection by ten observations. |
 | `/` in autonomous mode | Open interactive command input. |
 | `Up` / `Down` in interactive mode | Recall command history. |
 | `Enter` in interactive mode | Submit the typed command. |
 | `Esc` in interactive mode | Clear input and return to autonomous input. |
 | `Ctrl+C` | Exit. |
 
-The settings panel currently changes profile (`p`), theme (`t`), view arrangement (`l`), refresh interval (`r`), local autonomous collection (`a`), and LAN assessment (`n`). Profile, theme, refresh, autonomous, and LAN settings are saved. Turning LAN assessment off omits the LAN stages from the default Assisted session and hides the dedicated LAN scenario; the local stages still run. The arrangement applies to the current workspace session. The terminal must be at least 48 columns by 10 rows; the layout becomes denser as width increases.
+The settings panel currently changes profile (`p`), theme (`t`), view arrangement (`l`), refresh interval (`r`), local autonomous collection (`a`), and LAN assessment (`n`). Profile, theme, refresh, autonomous, and LAN settings are saved. Turning LAN assessment off omits the LAN stages from the default Assisted session, stops future LAN follow-ups, and hides the dedicated LAN scenario; local stages and follow-ups still run. The arrangement applies to the current workspace session. The terminal must be at least 48 columns by 10 rows; scenes adapt to the available width.
 
 ### Assisted scenarios
 
-No user-authored plan is needed. Press `F2` until **ASSISTED** appears. It opens on **System and network**, the default combined session. Press `F6` to run the complete sequence. With LAN assessment on, its 11 stages run `doctor`, `module list`, `traffic snapshot`, `process top`, `process inspect self`, `binary` on a real executable, `indicator list`, `lan status`, `lan survey` on the detected segment, `lan report`, and `triage`. The survey makes real TCP and selected HTTP(S) requests; the other stages read local data and retained evidence. With LAN assessment off, the three LAN stages are omitted, leaving eight local stages. No network survey starts merely by opening Assisted mode. If no suitable interface is detected, the context and survey stages report the problem while the remaining stages continue.
+No user-authored plan is needed. Press `F2` until **ASSISTED** appears. It opens on **System and network**, the default combined session, and builds scenes from any host, process, traffic, binary, and network observations already present. Mission, Network, Processes, Traffic, Binaries, and Timeline show distinct views of actual evidence. Host and binary dossier screens join the rotation when their corresponding observations arrive, so the lineup grows during an investigation. Entering Assisted does not start a network survey. Press `F6` to run the complete sequence. With LAN assessment on, its 11 stages run `doctor`, `module list`, `traffic snapshot`, `process top`, `process inspect self`, `binary` on a real executable, `indicator list`, `lan status`, `lan survey` on the detected segment, `lan report`, and `triage`. The survey makes real TCP and selected HTTP(S) requests; the other stages read local data and retained evidence. With LAN assessment off, the three LAN stages are omitted, leaving eight local stages. If no suitable interface is detected, the context and survey stages report the problem while the remaining stages continue.
+
+After any built-in F6 run, Assisted stays live: it refreshes process and traffic results about every 20 seconds. A recurring LAN survey is scheduled no more than once every 120 seconds only after an F6 run of **System and network** or **Local network**, and only while LAN assessment stays on. Other scenarios do not acquire recurring active scans. Follow-ups do not pile up while a previous request is still running. Leaving Assisted pauses scheduling. `F7` pauses or resumes future follow-ups after the first F6 run; an in-flight request can finish. `F8` controls automatic scene changes without stopping analysis. `F3` browses scenes and holds the selected one for 30 seconds before automatic changes resume. Up/Down and PageUp/PageDown scroll the selected scene and also hold it for 30 seconds. Automatic revisits advance through longer evidence lists. A new LAN host, open endpoint, or indicator match can bring its relevant scene into focus. Automatic display changes also draw on ongoing local collection; they do not imply a new probe was sent. The footer shows the current scene and activity state.
 
 The focused **Local research** scenario has seven stages: Environment (`doctor`), Collection (`module list`), Interface traffic (`traffic snapshot`), Initial triage (`triage`), Binary inspection, Indicators (`indicator list`), and Final review (`triage`). Binary inspection prefers SPECTRE's executable when it fits the 64 MiB analyzer limit and otherwise uses a small real platform executable. Background local collection continues during an Assisted run. Each stage uses the same commands and evidence as interactive mode.
 
@@ -125,7 +130,7 @@ workflow list
 
 For a custom step, Enter after the full reveal records a `prepared.input` event with `prepared` provenance and advances. Custom text is **never executed**. Use `workflow remove 2` or `workflow clear` to edit the sequence. Entries are saved in `prepared_workflow` in the configuration, with at most 256 steps and 4,096 bytes per step. Recorded prepared input is included in a JSON Lines export if it remains in memory. To run a custom command, switch to interactive mode and enter it there.
 
-Assisted mode is a deterministic prepared presentation, not an AI assistant or a shell. To change the event limit from the interactive prompt, use `retention set 5000`; the workspace display adopts it immediately, and the event hub adopts it on the next launch.
+Assisted mode runs built-in actions and presents their observed results; it is not an AI assistant or a shell. Custom prepared text is still presentation-only. To change the event limit from the interactive prompt, use `retention set 5000`; the workspace display adopts it immediately, and the event hub adopts it on the next launch.
 
 ## Configuration
 
@@ -138,7 +143,7 @@ Run `spectre configure` to locate the platform-specific configuration file. The 
 | `refresh_ms` | `500` | Terminal refresh interval; validated from 100 to 10,000 ms. |
 | `retention_events` | `2000` | Maximum in-memory event history; validated from 100 to 100,000. |
 | `autonomous` | `true` | Start local collection when launching the workspace. |
-| `lan_assessment_enabled` | `true` | Include the LAN survey in the default combined Assisted session and make the dedicated LAN scenario available. It sends no traffic until a survey is started. |
+| `lan_assessment_enabled` | `true` | Include the LAN survey in the default combined Assisted session and make the dedicated LAN scenario available. Entering Assisted does not probe; F6 on either LAN scenario starts the first survey, and follow-ups can repeat it no more than once every 120 seconds while Assisted remains active. |
 | `allowed_targets` | `[]` | Exact-match hosts or IP strings for active commands. |
 | `enabled_modules` | Selected by first-run profile | Local modules to run. `traffic` samples interface counters; `binary` enables bounded baseline and follow-up inspection of observed process executables and requires `process`; `correlation` enables subject links. |
 | `prepared_workflow` | `[]` | Optional custom assisted presentation entries. Built-in scenarios are available when this is empty. |
@@ -148,7 +153,7 @@ Run `spectre configure` to locate the platform-specific configuration file. The 
 
 Bundled profiles are `local-research` (host, process, traffic, correlation, and a small executable baseline), `binary-monitor` (the same modules with a larger binary budget), `focused` (process and correlation), and `offline` (no autonomous collection). `custom` preserves the current module selection. On first run, SPECTRE recommends `binary-monitor` when it detects at least 8 GiB of RAM and `local-research` otherwise. If memory inspection is unavailable, it uses `local-research`. `spectre doctor` reports the recommendation. Selecting a profile saves its settings and updates the running collector in the workspace.
 
-With `local-research`, the collector selects up to 16 executables from the initial process inventory, including SPECTRE's own executable when available. It remembers at most 64 distinct paths, queues at most 64 pending paths, and runs one binary analysis at a time. `binary-monitor` raises those limits to 128 initial executables, 512 distinct paths, 256 pending paths, and two analysis slots. Both profiles analyze at most one baseline path per five-second interval; newly observed process executables may also be inspected. Once the baseline queue is empty, one watched path is checked per interval for a changed size or modification time. A change can trigger reanalysis; the check does not prove the file content changed and is not a full filesystem integrity scan.
+With `local-research`, the collector selects up to 16 executables from the initial process inventory, including SPECTRE's own executable when available. It remembers at most 64 distinct paths, queues at most 64 pending paths, and runs one binary analysis at a time. `binary-monitor` raises those limits to 128 initial executables, 512 distinct paths, 256 pending paths, and two analysis slots. Both profiles analyze at most one baseline path per five-second interval; newly observed process executables may also be inspected. Autonomous inspection publishes compact identity, summary, and notable-finding events to keep the live stream readable. `spectre analyze binary PATH` or the workspace `binary PATH` command still returns the detailed sections, imports, symbols, and strings for an explicit investigation. Once the baseline queue is empty, one watched path is checked per interval for a changed size or modification time. A change can trigger reanalysis; the check does not prove the file content changed and is not a full filesystem integrity scan.
 
 ### Exact indicators
 
