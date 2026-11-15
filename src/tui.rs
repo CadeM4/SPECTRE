@@ -631,6 +631,8 @@ impl TuiState {
                         )
                     }
                 } else {
+                    self.live_watch = false;
+                    self.watch_scenario = None;
                     format!("{} run stopped; F6 retries", session_label(scenario_id))
                 };
             }
@@ -704,6 +706,13 @@ impl TuiState {
         }
         self.scenarios = scenarios;
         self.scenario_index = scenario_index;
+        if let Some(scenario_id) = self
+            .scenarios
+            .get(scenario_index)
+            .map(|scenario| scenario.id.clone())
+        {
+            self.projection.select_scenario(&scenario_id);
+        }
         self.theme = Theme::from_name(&config.theme);
         self.profile = config.profile.clone();
         self.refresh_ms = config.refresh_ms;
@@ -742,6 +751,7 @@ impl TuiState {
             (self.scenario_index + 1) % count
         };
         let scenario = &self.scenarios[self.scenario_index];
+        self.projection.select_scenario(&scenario.id);
         self.prepared = PreparedInput::new(
             scenario
                 .steps
@@ -771,6 +781,13 @@ impl TuiState {
             InteractionMode::Assisted => InteractionMode::Autonomous,
         };
         if self.mode == InteractionMode::Assisted {
+            if let Some(scenario_id) = self
+                .scenarios
+                .get(self.scenario_index)
+                .map(|scenario| scenario.id.clone())
+            {
+                self.projection.select_scenario(&scenario_id);
+            }
             self.scene = Scene::Mission;
             self.scene_scroll = 0;
             self.scene_auto = true;
@@ -872,6 +889,19 @@ impl TuiState {
         if self.manual_scene_until.is_some_and(|until| now >= until) {
             self.manual_scene_until = None;
             changed = true;
+        }
+        if self.scene_auto && self.manual_scene_until.is_none() {
+            let available = self.projection.available_scenes();
+            if !available.contains(&self.scene) {
+                self.scene = match self.scene {
+                    Scene::Host(_) if available.contains(&Scene::Network) => Scene::Network,
+                    Scene::BinaryDetail(_) if available.contains(&Scene::Binary) => Scene::Binary,
+                    _ => Scene::Mission,
+                };
+                self.scene_scroll = 0;
+                self.last_scene_change = now;
+                changed = true;
+            }
         }
         if self.scene_auto
             && self.manual_scene_until.is_none()
@@ -2589,6 +2619,100 @@ mod tests {
         assert!(state.manual_scene_until.is_some());
         assert!(render_state_to_text(&state, 120, 30).contains("11–15 OF 15"));
         state.tick(&tx);
+        assert_eq!(state.scene, Scene::Network);
+    }
+
+    #[test]
+    fn failed_full_run_does_not_start_follow_ups() {
+        let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        let (tx, mut rx) = mpsc::channel(4);
+        run_assisted_session(&mut state, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            WorkspaceRequest::AssistedRunSession { .. }
+        ));
+        state.ingest(
+            Event::new(
+                "presentation",
+                "assisted.session.error",
+                "Session could not start",
+                None,
+                Severity::Low,
+                SourceKind::Derived,
+            )
+            .with_evidence("scenario", "system-network", "test"),
+        );
+        assert!(!state.live_watch);
+        assert!(state.watch_scenario.is_none());
+        state.next_watch = Instant::now() - Duration::from_secs(1);
+        state.tick(&tx);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn scenario_change_switches_network_context_away_from_prior_target() {
+        let config = Config {
+            allowed_targets: vec!["example.org".into()],
+            ..Config::default()
+        };
+        let mut state = TuiState::new(config, PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        select_scenario(&mut state, "scoped-network:example.org");
+        state.ingest(
+            Event::new(
+                "network",
+                "tcp_scan_complete",
+                "example.org scan complete",
+                Some("example.org".into()),
+                Severity::Info,
+                SourceKind::Live,
+            )
+            .with_evidence("target", "example.org", "test"),
+        );
+        state.scene = Scene::Network;
+        assert!(render_state_to_text(&state, 120, 30).contains("NETWORK / SCOPED TARGET"));
+        select_scenario(&mut state, "system-network");
+        let screen = render_state_to_text(&state, 120, 30);
+        assert!(screen.contains("NETWORK / LAN SURVEY"));
+        assert!(!screen.contains("NETWORK / SCOPED TARGET"));
+    }
+
+    #[test]
+    fn disappearing_host_dossier_returns_to_network_during_resurvey() {
+        let mut state = TuiState::new(Config::default(), PathBuf::from("unused.toml"));
+        state.mode = InteractionMode::Assisted;
+        state.ingest(
+            Event::new(
+                "lan",
+                "lan.host",
+                "Host answered",
+                Some("192.168.1.4".into()),
+                Severity::Info,
+                SourceKind::Live,
+            )
+            .with_evidence("segment", "192.168.1.0/24", "test"),
+        );
+        assert!(
+            state
+                .projection
+                .available_scenes()
+                .contains(&Scene::Host(0))
+        );
+        state.scene = Scene::Host(0);
+        state.ingest(
+            Event::new(
+                "presentation",
+                "assisted.watch.stage.start",
+                "LAN resurvey running",
+                None,
+                Severity::Info,
+                SourceKind::Derived,
+            )
+            .with_evidence("command", "lan survey", "test"),
+        );
+        let (tx, _rx) = mpsc::channel(4);
+        assert!(state.tick(&tx));
         assert_eq!(state.scene, Scene::Network);
     }
 

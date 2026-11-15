@@ -135,6 +135,7 @@ pub(super) struct LiveProjection {
     survey: Option<Survey>,
     survey_running: bool,
     lan_hosts: BTreeMap<String, LanHost>,
+    current_survey_hosts: BTreeSet<String>,
     recent_network: VecDeque<Signal>,
     scoped: Option<ScopedTarget>,
     scoped_active: bool,
@@ -158,12 +159,7 @@ impl LiveProjection {
             "assisted.session.start" | "assisted.session.stage.start"
         ) && let Some(scenario) = field(event, "scenario")
         {
-            if let Some(target) = scenario.strip_prefix("scoped-network:") {
-                self.ensure_scoped(target);
-                self.scoped_active = true;
-            } else {
-                self.scoped_active = false;
-            }
+            self.select_scenario(scenario);
         }
         match event.kind.as_str() {
             "lan.status" => {
@@ -241,6 +237,7 @@ impl LiveProjection {
                 if field(event, "command").is_some_and(|command| command.starts_with("lan survey"))
                 {
                     self.lan_hosts.clear();
+                    self.current_survey_hosts.clear();
                     self.recent_network.clear();
                     self.survey_running = true;
                 }
@@ -287,6 +284,7 @@ impl LiveProjection {
                 if field(event, "command").is_some_and(|command| command.starts_with("lan survey"))
                 {
                     self.lan_hosts.clear();
+                    self.current_survey_hosts.clear();
                     self.recent_network.clear();
                     self.survey_running = true;
                 }
@@ -390,6 +388,15 @@ impl LiveProjection {
         }
     }
 
+    pub(super) fn select_scenario(&mut self, scenario: &str) {
+        if let Some(target) = scenario.strip_prefix("scoped-network:") {
+            self.ensure_scoped(target);
+            self.scoped_active = true;
+        } else {
+            self.scoped_active = false;
+        }
+    }
+
     fn featured_hosts(&self) -> Vec<&LanHost> {
         let mut hosts = self.lan_hosts.values().collect::<Vec<_>>();
         hosts.sort_by(|a, b| {
@@ -490,6 +497,7 @@ impl LiveProjection {
         let Some(address) = event.subject.as_deref() else {
             return;
         };
+        self.current_survey_hosts.insert(address.to_owned());
         let host = self
             .lan_hosts
             .entry(address.to_owned())
@@ -515,6 +523,7 @@ impl LiveProjection {
         let Some(port) = field(event, "port").and_then(|value| value.parse::<u16>().ok()) else {
             return;
         };
+        self.current_survey_hosts.insert(address.to_owned());
         let host = self
             .lan_hosts
             .entry(address.to_owned())
@@ -532,9 +541,9 @@ impl LiveProjection {
     }
 
     fn observe_survey(&mut self, event: &Event) {
-        if let Some(previous) = self.survey.as_ref() {
-            self.lan_hosts.retain(|_, host| host.seen > previous.seen);
-        }
+        self.lan_hosts
+            .retain(|address, _| self.current_survey_hosts.contains(address));
+        self.current_survey_hosts.clear();
         let segment = field(event, "segment")
             .or(event.subject.as_deref())
             .unwrap_or("unknown segment")
@@ -2347,6 +2356,18 @@ mod tests {
         first_completion.timestamp = first_host.timestamp + chrono::Duration::seconds(1);
         data.ingest(&first_completion);
         assert_eq!(data.lan_hosts.len(), 1);
+        let mut later_web = Event::new(
+            "web",
+            "http_response",
+            "HTTP 200 from first host",
+            Some("192.168.1.4".into()),
+            Severity::Info,
+            SourceKind::Live,
+        )
+        .with_evidence("local_segment", "192.168.1.0/24", "test")
+        .with_evidence("status", "200", "test");
+        later_web.timestamp = first_completion.timestamp + chrono::Duration::seconds(1);
+        data.ingest(&later_web);
         let mut second_completion = Event::new(
             "lan",
             "lan.survey_complete",
@@ -2356,7 +2377,7 @@ mod tests {
             SourceKind::Live,
         )
         .with_evidence("responded_hosts", "0", "tcp_connect");
-        second_completion.timestamp = first_completion.timestamp + chrono::Duration::seconds(1);
+        second_completion.timestamp = later_web.timestamp + chrono::Duration::seconds(1);
         data.ingest(&second_completion);
         assert!(data.lan_hosts.is_empty());
         assert!(render_text(Scene::Network, &data, 120, 20).contains("No host has answered"));
