@@ -56,7 +56,7 @@ pub fn inspect() -> CapabilityReport {
     let disasm = has_tool("objdump") || has_tool("llvm-objdump");
     let sample = cfg!(target_os = "macos") && has_tool("sample");
     let resources = has_tool("lsof");
-    let trace = has_tool("frida-trace");
+    let trace = cfg!(unix) && has_tool("frida-trace");
     let vt_key = key_configured("SPECTRE_VT_API_KEY");
     let abuse_key = key_configured("SPECTRE_ABUSEIPDB_API_KEY");
     CapabilityReport {
@@ -137,7 +137,9 @@ pub fn inspect() -> CapabilityReport {
             ModuleCapability {
                 name: "runtime_trace".into(),
                 available: trace,
-                detail: if trace {
+                detail: if !cfg!(unix) {
+                    "function tracing currently requires macOS or Linux"
+                } else if trace {
                     "optional on-demand function trace via frida-trace; process-attach permission is required"
                 } else {
                     "install frida-tools to enable optional on-demand function tracing"
@@ -264,8 +266,11 @@ mod tests {
         assert_eq!(module("runtime_resources").available, tool_present("lsof"));
         assert_eq!(
             module("runtime_trace").available,
-            tool_present("frida-trace")
+            cfg!(unix) && tool_present("frida-trace")
         );
+        if !cfg!(unix) {
+            assert!(module("runtime_trace").detail.contains("macOS or Linux"));
+        }
         assert_eq!(
             module("runtime_sample").available,
             cfg!(target_os = "macos") && tool_present("sample")
