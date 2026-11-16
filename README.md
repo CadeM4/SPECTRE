@@ -4,7 +4,7 @@ Terminal intelligence and security research environment
 
 Created by Cade Masterson
 
-[Two-page Mac quick-start sheet](docs/SPECTRE-Quick-Start.pdf)
+Quick starts: [macOS](docs/SPECTRE-Quick-Start.pdf) · [Windows](docs/SPECTRE-Windows-Quick-Start.pdf)
 
 SPECTRE brings local observations, offline artifact analysis, and explicitly scoped network assessment into one terminal workspace. Its event stream retains the evidence behind each observation. The current codebase is an early working foundation, with a focused set of analyzers and a shared interface for autonomous and hands-on work.
 
